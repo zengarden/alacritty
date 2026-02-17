@@ -313,6 +313,20 @@ in Alacritty while keeping the default behavior stable.
   - Retuned baseline shift from `+4px` to `+1px` after projection fix, since
     the previous larger shift was compensating for missing projection update.
   - Validation: `cargo check -p alacritty` and `cargo test -p alacritty` passed.
+- 2026-02-17: PR-8 phase-19 completed (macOS runtime compact geometry adaptation).
+  - Added native macOS traffic-light geometry probing in `Window`:
+    runtime reads close/zoom button frames, converts them into content-view
+    coordinates, and derives:
+    - traffic-light reserved width,
+    - traffic-light vertical center.
+  - Replaced hardcoded compact left reserved width with runtime value in compact
+    tab layout, keeping existing fallback constant only as a safety fallback.
+  - Replaced static compact title vertical alignment with runtime button-center
+    alignment (clamped inside compact titlebar visual height), reducing
+    cross-machine differences in title vertical placement.
+  - Added required AppKit feature flags (`NSButton`, `NSControl`) for native
+    `standardWindowButton` access.
+  - Validation: `cargo check -p alacritty` and `cargo test -p alacritty` passed.
 
 ## Guardrails
 

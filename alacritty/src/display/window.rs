@@ -23,7 +23,7 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::MainThreadMarker,
-    objc2_app_kit::{NSColorSpace, NSView},
+    objc2_app_kit::{NSColorSpace, NSView, NSWindowButton},
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -125,6 +125,47 @@ pub struct Window {
 }
 
 impl Window {
+    #[cfg(target_os = "macos")]
+    fn appkit_view(&self) -> Option<&NSView> {
+        match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                assert!(MainThreadMarker::new().is_some());
+                Some(unsafe { handle.ns_view.cast::<NSView>().as_ref() })
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn traffic_lights_geometry(&self) -> Option<(f32, f32)> {
+        // Match native spacing between traffic lights and title text.
+        const TRAFFIC_LIGHTS_TEXT_GAP_POINTS: f64 = 12.;
+
+        let view = self.appkit_view()?;
+        let window = view.window()?;
+
+        let close = window.standardWindowButton(NSWindowButton::CloseButton)?;
+        let close_superview = unsafe { close.superview() }?;
+        let close_rect = view.convertRect_fromView(close.frame(), Some(&close_superview));
+
+        let zoom_rect = window
+            .standardWindowButton(NSWindowButton::ZoomButton)
+            .and_then(|zoom| {
+                let zoom_superview = unsafe { zoom.superview() }?;
+                Some(view.convertRect_fromView(zoom.frame(), Some(&zoom_superview)))
+            })
+            .unwrap_or(close_rect);
+
+        let right = (close_rect.origin.x + close_rect.size.width)
+            .max(zoom_rect.origin.x + zoom_rect.size.width);
+        let center_y = close_rect.origin.y + close_rect.size.height * 0.5;
+
+        let scale = self.scale_factor as f32;
+        let reserved_width_px = (right + TRAFFIC_LIGHTS_TEXT_GAP_POINTS).max(0.) as f32 * scale;
+        let center_y_px = center_y.max(0.) as f32 * scale;
+        Some((reserved_width_px, center_y_px))
+    }
+
     /// Create a new window.
     ///
     /// This creates a window and fully initializes a window.
@@ -482,15 +523,13 @@ impl Window {
     /// This prevents rendering artifacts from showing up when the window is transparent.
     #[cfg(target_os = "macos")]
     pub fn set_has_shadow(&self, has_shadows: bool) {
-        let view = match self.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => {
-                assert!(MainThreadMarker::new().is_some());
-                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
-            },
-            _ => return,
+        let Some(view) = self.appkit_view() else {
+            return;
         };
-
-        view.window().unwrap().setHasShadow(has_shadows);
+        let Some(window) = view.window() else {
+            return;
+        };
+        window.setHasShadow(has_shadows);
     }
 
     /// macOS titlebar height in physical pixels.
@@ -501,13 +540,7 @@ impl Window {
     pub fn titlebar_height(&self) -> Option<f32> {
         const TITLEBAR_VISUAL_ADJUST_PX: f32 = 1.;
 
-        let view = match self.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => {
-                assert!(MainThreadMarker::new().is_some());
-                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
-            },
-            _ => return None,
-        };
+        let view = self.appkit_view()?;
 
         let window = view.window()?;
         let native_height =
@@ -515,6 +548,18 @@ impl Window {
         let native_height_px = native_height as f32 * self.scale_factor as f32;
 
         Some((native_height_px - TITLEBAR_VISUAL_ADJUST_PX).max(0.))
+    }
+
+    /// Horizontal reservation for macOS traffic lights in physical pixels.
+    #[cfg(target_os = "macos")]
+    pub fn traffic_lights_reserved_width(&self) -> Option<f32> {
+        self.traffic_lights_geometry().map(|(reserved_width, _)| reserved_width)
+    }
+
+    /// Vertical center of macOS traffic lights from the titlebar's top in physical pixels.
+    #[cfg(target_os = "macos")]
+    pub fn traffic_lights_center_y(&self) -> Option<f32> {
+        self.traffic_lights_geometry().map(|(_, center_y)| center_y)
     }
 
     /// Select tab at the given `index`.

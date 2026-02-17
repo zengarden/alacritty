@@ -86,7 +86,7 @@ const COMPACT_TAB_GAP_COLUMNS: usize = 1;
 
 /// Reserved left area for macOS traffic-light buttons in compact mode.
 #[cfg(target_os = "macos")]
-const MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH: f32 = 86.;
+const MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK: f32 = 86.;
 
 /// Approximate native titlebar height in macOS compact mode.
 #[cfg(target_os = "macos")]
@@ -98,7 +98,7 @@ const MACOS_COMPACT_CONTENT_GAP: f32 = 0.;
 
 /// Optical baseline shift for compact tab titles to align with traffic lights.
 #[cfg(target_os = "macos")]
-const MACOS_COMPACT_LABEL_BASELINE_SHIFT: f32 = 1.;
+const MACOS_COMPACT_LABEL_BASELINE_SHIFT: f32 = 0.;
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
@@ -670,22 +670,28 @@ impl Display {
     #[inline]
     fn compact_tab_label_padding_y(&self, config: &UiConfig, size_info: &SizeInfo) -> f32 {
         let bar_height = self.compact_tab_visual_height(config, size_info);
-        let mut padding_y = size_info.padding_y() + ((bar_height - size_info.cell_height()) * 0.5).max(0.);
+        let mut row_top = ((bar_height - size_info.cell_height()) * 0.5).max(0.);
 
         #[cfg(target_os = "macos")]
         {
             if matches!(config.window.tabs.mode, TabsMode::Compact)
                 && !matches!(config.window.decorations, Decorations::None)
             {
-                padding_y += MACOS_COMPACT_LABEL_BASELINE_SHIFT;
+                if let Some(buttons_center_y) = self.window.traffic_lights_center_y() {
+                    let centered_row_top = buttons_center_y - size_info.cell_height() * 0.5;
+                    let max_row_top = (bar_height - size_info.cell_height()).max(0.);
+                    row_top = centered_row_top.clamp(0., max_row_top);
+                }
+
+                row_top += MACOS_COMPACT_LABEL_BASELINE_SHIFT;
             }
         }
 
-        padding_y
+        size_info.padding_y() + row_top
     }
 
     #[inline]
-    fn compact_tab_start_column(config: &UiConfig, size_info: &SizeInfo) -> usize {
+    fn compact_tab_start_column(&self, config: &UiConfig, size_info: &SizeInfo) -> usize {
         #[cfg(target_os = "macos")]
         {
             if !matches!(config.window.tabs.mode, TabsMode::Compact) {
@@ -697,13 +703,17 @@ impl Display {
                 return 0;
             }
 
-            let reserve = (MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH / size_info.cell_width()).ceil();
+            let reserve_width = self
+                .window
+                .traffic_lights_reserved_width()
+                .unwrap_or(MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK);
+            let reserve = (reserve_width / size_info.cell_width()).ceil();
             return reserve as usize;
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (config, size_info);
+            let _ = (self, config, size_info);
             0
         }
     }
@@ -720,7 +730,7 @@ impl Display {
         }
 
         let columns = size_info.columns();
-        let start_column = Self::compact_tab_start_column(config, size_info).min(columns);
+        let start_column = self.compact_tab_start_column(config, size_info).min(columns);
         if start_column >= columns {
             return None;
         }
