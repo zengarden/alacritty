@@ -1180,7 +1180,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        let point = self
+            .ctx
+            .mouse()
+            .point(&self.ctx.size_info(), display_offset)
+            .grid_clamp(self.ctx.terminal(), Boundary::Grid);
         let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
 
         // Function to check if mouse is on top of a hint.

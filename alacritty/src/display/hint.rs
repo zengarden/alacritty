@@ -392,6 +392,7 @@ pub fn highlighted_at<T>(
     point: Point,
     mouse_mods: ModifiersState,
 ) -> Option<HintMatch> {
+    let point = point.grid_clamp(term, Boundary::Grid);
     let mouse_mode = term.mode().intersects(TermMode::MOUSE_MODE);
 
     config.hints.enabled.iter().find_map(|hint| {
@@ -426,6 +427,7 @@ pub fn highlighted_at<T>(
 ///
 /// This will only return contiguous cells, even if another hyperlink with the same ID exists.
 fn hyperlink_at<T>(term: &Term<T>, point: Point) -> Option<(Hyperlink, Match)> {
+    let point = point.grid_clamp(term, Boundary::Grid);
     let hyperlink = term.grid()[point].hyperlink()?;
 
     let grid = term.grid();
@@ -703,5 +705,13 @@ mod tests {
 
         // The iterator should match everything in the viewport.
         assert_eq!(visible_regex_match_iter(&term, &mut regex).count(), 4096);
+    }
+
+    #[test]
+    fn hyperlink_lookup_clamps_out_of_bounds_point() {
+        let term = mock_term("hello");
+
+        // Should not panic even if the input point is outside the terminal grid.
+        assert_eq!(None, hyperlink_at(&term, Point::new(Line(10_000), Column(10_000))));
     }
 }

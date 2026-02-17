@@ -28,7 +28,7 @@ use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::event::{EventListener, OnResize, WindowSize};
 use alacritty_terminal::grid::Dimensions as TermDimensions;
-use alacritty_terminal::index::{Column, Direction, Line, Point};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{
@@ -683,7 +683,9 @@ impl Display {
                     row_top = centered_row_top.clamp(0., max_row_top);
                 }
 
-                row_top += MACOS_COMPACT_LABEL_BASELINE_SHIFT;
+                let label_offset_px =
+                    config.window.tabs.compact.label_offset_y * self.window.scale_factor as f32;
+                row_top += MACOS_COMPACT_LABEL_BASELINE_SHIFT + label_offset_px;
             }
         }
 
@@ -703,9 +705,13 @@ impl Display {
                 return 0;
             }
 
-            let reserve_width = self
+            let reserve_width = config
                 .window
-                .traffic_lights_reserved_width()
+                .tabs
+                .compact
+                .left_inset
+                .map(|left_inset| left_inset.max(0.) * self.window.scale_factor as f32)
+                .or_else(|| self.window.traffic_lights_reserved_width())
                 .unwrap_or(MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK);
             let reserve = (reserve_width / size_info.cell_width()).ceil();
             return reserve as usize;
@@ -1005,9 +1011,13 @@ impl Display {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
-        // Resize when terminal when its dimensions have changed.
+        // Resize terminal/PTTY when either display geometry changed or the active terminal
+        // dimensions are stale (e.g. switching to an inactive tab after window/font changes).
+        let terminal_stale = terminal.screen_lines() != new_size.screen_lines()
+            || terminal.columns() != new_size.columns();
         if self.size_info.screen_lines() != new_size.screen_lines
             || self.size_info.columns() != new_size.columns()
+            || terminal_stale
         {
             // Resize PTY.
             pty_resize_handle.on_resize(new_size.into());
@@ -1445,7 +1455,9 @@ impl Display {
 
         // Find highlighted hint at mouse position.
         let size_info = self.terminal_size_info(config);
-        let point = mouse.point(&size_info, term.grid().display_offset());
+        let point = mouse
+            .point(&size_info, term.grid().display_offset())
+            .grid_clamp(term, Boundary::Grid);
         let highlighted_hint = hint::highlighted_at(term, config, point, modifiers);
 
         // Update cursor shape.

@@ -129,7 +129,7 @@ This section documents the *[window]* table of the configuration file.
 
 	Default: _"Full"_
 
-*tabs* = { mode = _"Native"_ | _"Compact"_ }
+*tabs* = { mode = _"Native"_ | _"Compact"_, compact = { left_inset = _<float>_ | _null_, label_offset_y = _<float>_ } }
 
 	Tab management mode.
 
@@ -138,8 +138,13 @@ This section documents the *[window]* table of the configuration file.
 	*Compact*
 		Use Alacritty's compact tab mode.
 
-	As of this release stage, _"Compact"_ is a reserved mode and currently
-	behaves like _"Native"_.
+	*compact.left_inset* _(macOS only)_
+		Optional compact left inset override in points.
+		When _null_, Alacritty uses runtime native traffic-light geometry.
+
+	*compact.label_offset_y* _(macOS only)_
+		Additional compact title vertical offset in points.
+		Useful for per-machine visual micro-tuning.
 
 	Default: { mode = _"Native"_ }
 

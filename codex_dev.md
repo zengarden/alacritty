@@ -327,6 +327,47 @@ in Alacritty while keeping the default behavior stable.
   - Added required AppKit feature flags (`NSButton`, `NSControl`) for native
     `standardWindowButton` access.
   - Validation: `cargo check -p alacritty` and `cargo test -p alacritty` passed.
+- 2026-02-17: PR-8 phase-20 completed (compact tuning config overrides).
+  - Added `window.tabs.compact` config group:
+    - `left_inset` (optional float, points),
+    - `label_offset_y` (float, points).
+  - Integrated overrides into compact runtime geometry:
+    - when `left_inset` is set, it overrides runtime traffic-light reserved
+      width (after point->pixel scaling),
+    - `label_offset_y` is applied on top of runtime button-center alignment
+      (point->pixel scaling).
+  - Added config parsing tests for defaults and explicit compact tuning values.
+  - Updated man page docs for `tabs.compact`.
+  - Validation: `cargo check -p alacritty` and `cargo test -p alacritty` passed.
+- 2026-02-17: Root-cause analysis + hardening for intermittent OOB panics
+  (`input/mod.rs` / `display/hint.rs`).
+  - Reported symptoms:
+    - `alacritty/src/input/mod.rs` cursor-state path OOB while dragging tabs.
+    - `alacritty/src/display/hint.rs:429` OOB (`grid()[point]`) even after
+      rolling back newer tab-drag changes.
+  - Root cause (code-level):
+    - The mouse point is derived from display-side `SizeInfo` (`Mouse::point`)
+      and can be valid for display columns while invalid for the active
+      terminal grid columns.
+    - In multi-tab lifecycle, inactive tabs can keep stale terminal dimensions
+      after window/font changes; when switching back, display size and terminal
+      grid size may diverge transiently.
+    - Existing resize trigger in `Display::handle_update` only compared
+      `self.size_info` vs `new_size`, and did not force resize when terminal
+      itself was stale against `new_size`.
+    - Any direct `term.grid()[point]` indexing in that window can panic.
+  - Fixes applied:
+    - `Display::handle_update` now also checks terminal actual dimensions
+      (`terminal.screen_lines()/columns()`) against `new_size` and forces
+      PTY+terminal resize when stale.
+    - Added grid-boundary clamping before hint lookups:
+      `update_highlighted_hints` and `hint::highlighted_at`/`hyperlink_at`.
+    - Added grid-boundary clamping in `input::Processor::cursor_state` before
+      direct `terminal.grid()[point]` hyperlink access.
+    - Added regression test `hyperlink_lookup_clamps_out_of_bounds_point`.
+  - Validation:
+    - `cargo check -p alacritty`
+    - `cargo test -p alacritty` (85 tests passed in current tree state)
 
 ## Guardrails
 

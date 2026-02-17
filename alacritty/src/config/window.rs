@@ -192,15 +192,35 @@ pub enum Decorations {
     None,
 }
 
-#[derive(ConfigDeserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(ConfigDeserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct TabsConfig {
     /// Internal/native tabs mode.
     pub mode: TabsMode,
+
+    /// Compact mode fine-tuning.
+    pub compact: CompactTabsConfig,
 }
 
 impl Default for TabsConfig {
     fn default() -> Self {
-        Self { mode: Default::default() }
+        Self { mode: Default::default(), compact: Default::default() }
+    }
+}
+
+#[derive(ConfigDeserialize, Serialize, Debug, Clone, Copy, PartialEq)]
+pub struct CompactTabsConfig {
+    /// Override compact left inset in points.
+    ///
+    /// `None` uses runtime macOS traffic-light geometry.
+    pub left_inset: Option<f32>,
+
+    /// Additional vertical title offset in points.
+    pub label_offset_y: f32,
+}
+
+impl Default for CompactTabsConfig {
+    fn default() -> Self {
+        Self { left_inset: None, label_offset_y: 0.0 }
     }
 }
 
@@ -363,5 +383,23 @@ mod tests {
         let config: WindowConfig =
             toml::from_str("[tabs]\nmode = \"Compact\"\n").expect("parse compact tabs mode");
         assert_eq!(config.tabs.mode, TabsMode::Compact);
+    }
+
+    #[test]
+    fn tabs_compact_defaults_are_stable() {
+        let config: WindowConfig = toml::from_str("").expect("parse window config");
+        assert_eq!(config.tabs.compact.left_inset, None);
+        assert_eq!(config.tabs.compact.label_offset_y, 0.0);
+    }
+
+    #[test]
+    fn tabs_compact_tuning_is_deserializable() {
+        let config: WindowConfig = toml::from_str(
+            "[tabs]\nmode = \"Compact\"\n[tabs.compact]\nleft_inset = 72.5\nlabel_offset_y = -1.5\n",
+        )
+        .expect("parse compact tabs tuning");
+        assert_eq!(config.tabs.mode, TabsMode::Compact);
+        assert_eq!(config.tabs.compact.left_inset, Some(72.5));
+        assert_eq!(config.tabs.compact.label_offset_y, -1.5);
     }
 }
