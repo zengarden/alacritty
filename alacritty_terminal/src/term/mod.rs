@@ -525,6 +525,11 @@ impl<T> Term<T> {
         self.mark_fully_damaged();
     }
 
+    #[inline]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     /// Convert the active selection to a String.
     pub fn selection_to_string(&self) -> Option<String> {
         let selection_range = self.selection.as_ref().and_then(|s| s.to_range(self))?;

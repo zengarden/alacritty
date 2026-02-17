@@ -65,6 +65,9 @@ pub struct WindowConfig {
 
     /// Window level.
     pub level: WindowLevel,
+
+    /// Tab-related options.
+    pub tabs: TabsConfig,
 }
 
 impl Default for WindowConfig {
@@ -85,6 +88,7 @@ impl Default for WindowConfig {
             decorations_theme_variant: Default::default(),
             option_as_alt: Default::default(),
             level: Default::default(),
+            tabs: Default::default(),
         }
     }
 }
@@ -186,6 +190,25 @@ pub enum Decorations {
     Transparent,
     Buttonless,
     None,
+}
+
+#[derive(ConfigDeserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TabsConfig {
+    /// Internal/native tabs mode.
+    pub mode: TabsMode,
+}
+
+impl Default for TabsConfig {
+    fn default() -> Self {
+        Self { mode: Default::default() }
+    }
+}
+
+#[derive(ConfigDeserialize, Serialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TabsMode {
+    #[default]
+    Native,
+    Compact,
 }
 
 /// Window Dimensions.
@@ -322,5 +345,23 @@ impl From<WindowLevel> for WinitWindowLevel {
             WindowLevel::Normal => WinitWindowLevel::Normal,
             WindowLevel::AlwaysOnTop => WinitWindowLevel::AlwaysOnTop,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TabsMode, WindowConfig};
+
+    #[test]
+    fn tabs_mode_defaults_to_native() {
+        let config: WindowConfig = toml::from_str("").expect("parse window config");
+        assert_eq!(config.tabs.mode, TabsMode::Native);
+    }
+
+    #[test]
+    fn tabs_mode_compact_is_deserializable() {
+        let config: WindowConfig =
+            toml::from_str("[tabs]\nmode = \"Compact\"\n").expect("parse compact tabs mode");
+        assert_eq!(config.tabs.mode, TabsMode::Compact);
     }
 }

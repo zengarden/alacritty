@@ -56,13 +56,14 @@ use crate::daemon::spawn_daemon;
 use crate::display::color::Rgb;
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
-use crate::display::{Display, Preedit, SizeInfo};
+use crate::display::{Display, Preedit, SizeInfo, TabBarEntry};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
 #[cfg(unix)]
 use crate::polling::ipc::{self, SocketReply};
 use crate::scheduler::{Scheduler, TimerId, Topic};
+use crate::tabs::TabId;
 use crate::window_context::WindowContext;
 
 /// Duration after the last user input until an unlimited search is performed.
@@ -225,6 +226,44 @@ impl Processor {
                 | WindowEvent::Moved(_)
         )
     }
+
+    fn close_window_context(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        respect_hold: bool,
+    ) -> bool {
+        let window_context = match self.windows.entry(window_id) {
+            Entry::Occupied(window_context)
+                if !respect_hold || !window_context.get().display.window.hold =>
+            {
+                window_context.remove()
+            },
+            _ => return false,
+        };
+
+        // Unschedule pending events.
+        self.scheduler.unschedule_window(window_context.id());
+
+        // Shutdown if no more terminals are open.
+        if self.windows.is_empty() && !self.cli_options.daemon {
+            // Write ref tests of last window to disk.
+            if self.config.debug.ref_test {
+                window_context.write_ref_test_results();
+            }
+
+            event_loop.exit();
+        }
+
+        true
+    }
+
+    fn close_all_windows(&mut self, event_loop: &ActiveEventLoop) {
+        let window_ids: Vec<_> = self.windows.keys().copied().collect();
+        for window_id in window_ids {
+            let _ = self.close_window_context(event_loop, window_id, false);
+        }
+    }
 }
 
 impl ApplicationHandler<Event> for Processor {
@@ -287,11 +326,13 @@ impl ApplicationHandler<Event> for Processor {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
 
+        let Event { payload, window_id, tab_id } = event;
+
         // Handle events which don't mandate the WindowId.
-        match (event.payload, event.window_id.as_ref()) {
+        match (payload, window_id.as_ref(), tab_id) {
             // Process IPC config update.
             #[cfg(unix)]
-            (EventType::IpcConfig(ipc_config), window_id) => {
+            (EventType::IpcConfig(ipc_config), window_id, _) => {
                 // Try and parse options as toml.
                 let mut options = ParsedOptions::from_options(&ipc_config.options);
 
@@ -319,7 +360,7 @@ impl ApplicationHandler<Event> for Processor {
             },
             // Process IPC config requests.
             #[cfg(unix)]
-            (EventType::IpcGetConfig(stream), window_id) => {
+            (EventType::IpcGetConfig(stream), window_id, _) => {
                 // Get the config for the requested window ID.
                 let config = match self.windows.iter().find(|(id, _)| window_id == Some(*id)) {
                     Some((_, window_context)) => window_context.config(),
@@ -340,11 +381,11 @@ impl ApplicationHandler<Event> for Processor {
                     ipc::send_reply(&mut stream, SocketReply::GetConfig(config_json));
                 }
             },
-            (EventType::ConfigReload(path), _) => {
+            (EventType::ConfigReload(path), _, _) => {
                 // Clear config logs from message bar for all terminals.
                 for window_context in self.windows.values_mut() {
-                    if !window_context.message_buffer.is_empty() {
-                        window_context.message_buffer.remove_target(LOG_TARGET_CONFIG);
+                    if !window_context.message_buffer().is_empty() {
+                        window_context.message_buffer_mut().remove_target(LOG_TARGET_CONFIG);
                         window_context.display.pending_update.dirty = true;
                     }
                 }
@@ -370,7 +411,7 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             // Create a new terminal window.
-            (EventType::CreateWindow(options), _) => {
+            (EventType::CreateWindow(options), _, _) => {
                 // XXX Ensure that no context is current when creating a new window,
                 // otherwise it may lock the backing buffer of the
                 // surface of current context when asking
@@ -389,12 +430,67 @@ impl ApplicationHandler<Event> for Processor {
                     error!("Could not open window: {err:?}");
                 }
             },
+            (EventType::CloseWindow, Some(window_id), _) => {
+                let _ = self.close_window_context(event_loop, *window_id, false);
+            },
+            (EventType::Quit, _, _) => {
+                self.close_all_windows(event_loop);
+                event_loop.exit();
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::CreateTab(options), Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    if let Err(err) = window_context.create_tab(self.proxy.clone(), options) {
+                        error!("Could not create tab: {err:?}");
+                    }
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::CloseInternalTab, Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.close_active_tab(&mut self.scheduler);
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::SelectNextInternalTab, Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.select_next_tab();
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::SelectPreviousInternalTab, Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.select_previous_tab();
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::SelectInternalTab(index), Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.select_tab_at_index(index);
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::SelectLastInternalTab, Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.select_last_tab();
+                }
+            },
+            (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id), tab_id) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.set_tab_osc_title(tab_id, title);
+                }
+            },
+            (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id), tab_id) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.reset_tab_osc_title(tab_id);
+                }
+            },
             // Shutdown all windows.
             #[cfg(unix)]
-            (EventType::Shutdown, _) => event_loop.exit(),
+            (EventType::Shutdown, _, _) => event_loop.exit(),
             // Process events affecting all windows.
-            (payload, None) => {
-                let event = WinitEvent::UserEvent(Event::new(payload, None));
+            (payload, None, tab_id) => {
+                let event = WinitEvent::UserEvent(Event::new_with_tab(payload, None, tab_id));
                 for window_context in self.windows.values_mut() {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
@@ -406,41 +502,33 @@ impl ApplicationHandler<Event> for Processor {
                     );
                 }
             },
-            (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
+            (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id), tab_id) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
+                    if tab_id.is_some_and(|tab_id| !window_context.is_active_tab(tab_id)) {
+                        return;
+                    }
+
                     window_context.dirty = true;
                     if window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
                     }
                 }
             },
-            (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                // Remove the closed terminal.
-                let window_context = match self.windows.entry(*window_id) {
-                    // Don't exit when terminal exits if user asked to hold the window.
-                    Entry::Occupied(window_context)
-                        if !window_context.get().display.window.hold =>
-                    {
-                        window_context.remove()
+            (EventType::Terminal(TerminalEvent::Exit), Some(window_id), tab_id) => {
+                let should_close_window = match self.windows.get_mut(window_id) {
+                    Some(window_context) => {
+                        window_context.handle_tab_exit(tab_id, &mut self.scheduler)
                     },
-                    _ => return,
+                    None => return,
                 };
-
-                // Unschedule pending events.
-                self.scheduler.unschedule_window(window_context.id());
-
-                // Shutdown if no more terminals are open.
-                if self.windows.is_empty() && !self.cli_options.daemon {
-                    // Write ref tests of last window to disk.
-                    if self.config.debug.ref_test {
-                        window_context.write_ref_test_results();
-                    }
-
-                    event_loop.exit();
+                if !should_close_window {
+                    return;
                 }
+
+                let _ = self.close_window_context(event_loop, *window_id, false);
             },
             // NOTE: This event bypasses batching to minimize input latency.
-            (EventType::Frame, Some(window_id)) => {
+            (EventType::Frame, Some(window_id), _) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
                     if window_context.dirty {
@@ -448,7 +536,7 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
-            (payload, Some(window_id)) => {
+            (payload, Some(window_id), tab_id) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
@@ -456,7 +544,7 @@ impl ApplicationHandler<Event> for Processor {
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
-                        WinitEvent::UserEvent(Event::new(payload, *window_id)),
+                        WinitEvent::UserEvent(Event::new_with_tab(payload, *window_id, tab_id)),
                     );
                 }
             },
@@ -522,13 +610,28 @@ pub struct Event {
     /// Limit event to a specific window.
     window_id: Option<WindowId>,
 
+    /// Limit event to a specific tab.
+    tab_id: Option<TabId>,
+
     /// Event payload.
     payload: EventType,
 }
 
 impl Event {
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
-        Self { window_id: window_id.into(), payload }
+        Self { window_id: window_id.into(), tab_id: None, payload }
+    }
+
+    pub fn new_with_tab<I: Into<Option<WindowId>>, J: Into<Option<TabId>>>(
+        payload: EventType,
+        window_id: I,
+        tab_id: J,
+    ) -> Self {
+        Self { window_id: window_id.into(), tab_id: tab_id.into(), payload }
+    }
+
+    pub fn tab_id(&self) -> Option<TabId> {
+        self.tab_id
     }
 }
 
@@ -546,6 +649,14 @@ pub enum EventType {
     Message(Message),
     Scroll(Scroll),
     CreateWindow(WindowOptions),
+    CloseWindow,
+    Quit,
+    CreateTab(WindowOptions),
+    CloseInternalTab,
+    SelectNextInternalTab,
+    SelectPreviousInternalTab,
+    SelectInternalTab(usize),
+    SelectLastInternalTab,
     #[cfg(unix)]
     IpcConfig(IpcConfig),
     #[cfg(unix)]
@@ -663,6 +774,7 @@ impl Default for InlineSearchState {
 pub struct ActionContext<'a, N, T> {
     pub notifier: &'a mut N,
     pub terminal: &'a mut Term<T>,
+    pub tab_id: TabId,
     pub clipboard: &'a mut Clipboard,
     pub mouse: &'a mut Mouse,
     pub touch: &'a mut TouchPurpose,
@@ -678,6 +790,7 @@ pub struct ActionContext<'a, N, T> {
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub inline_search_state: &'a mut InlineSearchState,
+    pub tab_bar_entries: &'a [TabBarEntry],
     pub dirty: &'a mut bool,
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
@@ -701,7 +814,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[inline]
     fn size_info(&self) -> SizeInfo {
-        self.display.size_info
+        self.display.terminal_size_info(self.config)
     }
 
     fn scroll(&mut self, scroll: Scroll) {
@@ -902,6 +1015,63 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
     }
 
+    fn close_window(&mut self) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::CloseWindow, window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    fn quit(&mut self) {
+        let event = Event::new(EventType::Quit, None);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_internal_tab(&mut self) {
+        let mut options = WindowOptions::default();
+        options.terminal_options.working_directory =
+            foreground_process_path(self.master_fd, self.shell_pid).ok();
+
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::CreateTab(options), window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close_internal_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::CloseInternalTab, window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_next_internal_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::SelectNextInternalTab, window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_previous_internal_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::SelectPreviousInternalTab, window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_internal_tab(&mut self, index: usize) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::SelectInternalTab(index), window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_last_internal_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::SelectLastInternalTab, window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
     where
         I: IntoIterator<Item = S> + Debug + Copy,
@@ -1035,7 +1205,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
 
         // Force unlimited search if the previous one was interrupted.
-        let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+        let timer_id =
+            TimerId::new(Topic::DelayedSearch, self.display.window.id(), Some(self.tab_id));
         if self.scheduler.scheduled(timer_id) {
             self.goto_match(None);
         }
@@ -1200,7 +1371,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn on_typing_start(&mut self) {
         // Disable cursor blinking.
-        let timer_id = TimerId::new(Topic::BlinkCursor, self.display.window.id());
+        let timer_id =
+            TimerId::new(Topic::BlinkCursor, self.display.window.id(), Some(self.tab_id));
         if self.scheduler.unschedule(timer_id).is_some() {
             self.schedule_blinking();
 
@@ -1497,6 +1669,14 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn scheduler_mut(&mut self) -> &mut Scheduler {
         self.scheduler
     }
+
+    fn tab_bar_hit_test(&self, x: usize, y: usize) -> Option<usize> {
+        self.display.compact_tab_at_position(self.config, self.tab_bar_entries, x, y)
+    }
+
+    fn scheduler_tab_id(&self) -> Option<TabId> {
+        Some(self.tab_id)
+    }
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
@@ -1529,7 +1709,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     /// Reset terminal to the state before search was started.
     fn search_reset_state(&mut self) {
         // Unschedule pending timers.
-        let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+        let timer_id =
+            TimerId::new(Topic::DelayedSearch, self.display.window.id(), Some(self.tab_id));
         self.scheduler.unschedule(timer_id);
 
         // Clear focused match.
@@ -1583,16 +1764,22 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 self.search_state.display_offset_delta += old_offset - display_offset as i32;
 
                 // Since we found a result, we require no delayed re-search.
-                let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+                let timer_id =
+                    TimerId::new(Topic::DelayedSearch, self.display.window.id(), Some(self.tab_id));
                 self.scheduler.unschedule(timer_id);
             },
             // Reset viewport only when we know there is no match, to prevent unnecessary jumping.
             None if limit.is_none() => self.search_reset_state(),
             None => {
                 // Schedule delayed search if we ran into our search limit.
-                let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+                let timer_id =
+                    TimerId::new(Topic::DelayedSearch, self.display.window.id(), Some(self.tab_id));
                 if !self.scheduler.scheduled(timer_id) {
-                    let event = Event::new(EventType::SearchNext, self.display.window.id());
+                    let event = Event::new_with_tab(
+                        EventType::SearchNext,
+                        self.display.window.id(),
+                        self.tab_id,
+                    );
                     self.scheduler.schedule(event, TYPING_SEARCH_DELAY, false, timer_id);
                 }
 
@@ -1634,8 +1821,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
         // Update cursor blinking state.
         let window_id = self.display.window.id();
-        self.scheduler.unschedule(TimerId::new(Topic::BlinkCursor, window_id));
-        self.scheduler.unschedule(TimerId::new(Topic::BlinkTimeout, window_id));
+        self.scheduler.unschedule(TimerId::new(Topic::BlinkCursor, window_id, Some(self.tab_id)));
+        self.scheduler.unschedule(TimerId::new(Topic::BlinkTimeout, window_id, Some(self.tab_id)));
 
         // Reset blinking timeout.
         *self.cursor_blink_timed_out = false;
@@ -1651,8 +1838,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
     fn schedule_blinking(&mut self) {
         let window_id = self.display.window.id();
-        let timer_id = TimerId::new(Topic::BlinkCursor, window_id);
-        let event = Event::new(EventType::BlinkCursor, window_id);
+        let timer_id = TimerId::new(Topic::BlinkCursor, window_id, Some(self.tab_id));
+        let event = Event::new_with_tab(EventType::BlinkCursor, window_id, self.tab_id);
         let blinking_interval = Duration::from_millis(self.config.cursor.blink_interval());
         self.scheduler.schedule(event, blinking_interval, true, timer_id);
     }
@@ -1664,8 +1851,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
 
         let window_id = self.display.window.id();
-        let event = Event::new(EventType::BlinkCursorTimeout, window_id);
-        let timer_id = TimerId::new(Topic::BlinkTimeout, window_id);
+        let event = Event::new_with_tab(EventType::BlinkCursorTimeout, window_id, self.tab_id);
+        let timer_id = TimerId::new(Topic::BlinkTimeout, window_id, Some(self.tab_id));
 
         self.scheduler.schedule(event, blinking_timeout, false, timer_id);
     }
@@ -1853,7 +2040,11 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 },
                 EventType::BlinkCursorTimeout => {
                     // Disable blinking after timeout reached.
-                    let timer_id = TimerId::new(Topic::BlinkCursor, self.ctx.display.window.id());
+                    let timer_id = TimerId::new(
+                        Topic::BlinkCursor,
+                        self.ctx.display.window.id(),
+                        Some(self.ctx.tab_id),
+                    );
                     self.ctx.scheduler.unschedule(timer_id);
                     *self.ctx.cursor_blink_timed_out = true;
                     self.ctx.display.cursor_hidden = false;
@@ -1933,14 +2124,20 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
+                | EventType::CloseWindow
+                | EventType::Quit
+                | EventType::CreateTab(_)
+                | EventType::CloseInternalTab
+                | EventType::SelectNextInternalTab
+                | EventType::SelectPreviousInternalTab
+                | EventType::SelectInternalTab(_)
+                | EventType::SelectLastInternalTab
                 | EventType::Frame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
                     WindowEvent::CloseRequested => {
-                        // User asked to close the window, so no need to hold it.
-                        self.ctx.window().hold = false;
-                        self.ctx.terminal.exit();
+                        self.ctx.close_window();
                     },
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         let old_scale_factor =
@@ -2073,21 +2270,23 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 pub struct EventProxy {
     proxy: EventLoopProxy<Event>,
     window_id: WindowId,
+    tab_id: Option<TabId>,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: Option<TabId>) -> Self {
+        Self { proxy, window_id, tab_id }
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let _ = self.proxy.send_event(Event::new_with_tab(event, self.window_id, self.tab_id));
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let _ =
+            self.proxy.send_event(Event::new_with_tab(event.into(), self.window_id, self.tab_id));
     }
 }

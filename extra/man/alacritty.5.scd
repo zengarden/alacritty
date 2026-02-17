@@ -129,6 +129,20 @@ This section documents the *[window]* table of the configuration file.
 
 	Default: _"Full"_
 
+*tabs* = { mode = _"Native"_ | _"Compact"_ }
+
+	Tab management mode.
+
+	*Native*
+		Use the platform-native tab behavior.
+	*Compact*
+		Use Alacritty's compact tab mode.
+
+	As of this release stage, _"Compact"_ is a reserved mode and currently
+	behaves like _"Native"_.
+
+	Default: { mode = _"Native"_ }
+
 *opacity* = _<float>_
 
 	Background opacity as a floating point number from _0.0_ to _1.0_. The value

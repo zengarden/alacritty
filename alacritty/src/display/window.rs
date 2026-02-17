@@ -42,8 +42,8 @@ use winit::window::{
 use alacritty_terminal::index::Point;
 
 use crate::cli::WindowOptions;
+use crate::config::window::{Decorations, Identity, TabsMode, WindowConfig};
 use crate::config::UiConfig;
-use crate::config::window::{Decorations, Identity, WindowConfig};
 use crate::display::SizeInfo;
 
 /// Window icon for `_NET_WM_ICON` property.
@@ -343,7 +343,17 @@ impl Window {
             window = window.with_tabbing_identifier(tabbing_id);
         }
 
-        match window_config.decorations {
+        // Compact tabs look best when the content view reaches into a transparent titlebar.
+        // Keep explicit user overrides intact and only rewrite the default `Full`.
+        let decorations = if matches!(window_config.tabs.mode, TabsMode::Compact)
+            && matches!(window_config.decorations, Decorations::Full)
+        {
+            Decorations::Transparent
+        } else {
+            window_config.decorations
+        };
+
+        match decorations {
             Decorations::Full => window,
             Decorations::Transparent => window
                 .with_title_hidden(true)
@@ -481,6 +491,30 @@ impl Window {
         };
 
         view.window().unwrap().setHasShadow(has_shadows);
+    }
+
+    /// macOS titlebar height in physical pixels.
+    ///
+    /// This uses `contentLayoutRect` to follow native titlebar geometry instead of relying on
+    /// hardcoded constants.
+    #[cfg(target_os = "macos")]
+    pub fn titlebar_height(&self) -> Option<f32> {
+        const TITLEBAR_VISUAL_ADJUST_PX: f32 = 1.;
+
+        let view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => {
+                assert!(MainThreadMarker::new().is_some());
+                unsafe { handle.ns_view.cast::<NSView>().as_ref() }
+            },
+            _ => return None,
+        };
+
+        let window = view.window()?;
+        let native_height =
+            (window.frame().size.height - window.contentLayoutRect().size.height).max(0.);
+        let native_height_px = native_height as f32 * self.scale_factor as f32;
+
+        Some((native_height_px - TITLEBAR_VISUAL_ADJUST_PX).max(0.))
     }
 
     /// Select tab at the given `index`.

@@ -37,7 +37,7 @@ use alacritty_terminal::vte::ansi::{ClearMode, Handler};
 
 use crate::clipboard::Clipboard;
 #[cfg(target_os = "macos")]
-use crate::config::window::Decorations;
+use crate::config::window::{Decorations, TabsMode};
 use crate::config::{
     Action, BindingMode, MouseAction, MouseEvent, SearchAction, UiConfig, ViAction,
 };
@@ -49,6 +49,7 @@ use crate::event::{
 };
 use crate::message_bar::{self, Message};
 use crate::scheduler::{Scheduler, TimerId, Topic};
+use crate::tabs::TabId;
 
 pub mod keyboard;
 
@@ -103,6 +104,20 @@ pub trait ActionContext<T: EventListener> {
     fn create_new_window(&mut self, _tabbing_id: Option<String>) {}
     #[cfg(not(target_os = "macos"))]
     fn create_new_window(&mut self) {}
+    fn close_window(&mut self) {}
+    fn quit(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn create_internal_tab(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn select_next_internal_tab(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn select_previous_internal_tab(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn select_internal_tab(&mut self, _index: usize) {}
+    #[cfg(target_os = "macos")]
+    fn select_last_internal_tab(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn close_internal_tab(&mut self) {}
     fn change_font_size(&mut self, _delta: f32) {}
     fn reset_font_size(&mut self) {}
     fn pop_message(&mut self) {}
@@ -112,7 +127,13 @@ pub trait ActionContext<T: EventListener> {
     fn event_loop(&self) -> &ActiveEventLoop;
     fn mouse_mode(&self) -> bool;
     fn clipboard_mut(&mut self) -> &mut Clipboard;
+    fn tab_bar_hit_test(&self, _x: usize, _y: usize) -> Option<usize> {
+        None
+    }
     fn scheduler_mut(&mut self) -> &mut Scheduler;
+    fn scheduler_tab_id(&self) -> Option<TabId> {
+        None
+    }
     fn start_search(&mut self, _direction: Direction) {}
     fn start_seeded_search(&mut self, _direction: Direction, _text: String) {}
     fn confirm_search(&mut self) {}
@@ -343,10 +364,17 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(not(target_os = "macos"))]
             Action::Hide => ctx.window().set_visible(false),
             Action::Minimize => ctx.window().set_minimized(true),
-            Action::Quit => {
-                ctx.window().hold = false;
-                ctx.terminal_mut().exit();
+            Action::Close => {
+                #[cfg(target_os = "macos")]
+                match ctx.config().window.tabs.mode {
+                    TabsMode::Compact => ctx.close_internal_tab(),
+                    TabsMode::Native => ctx.close_window(),
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                ctx.close_window();
             },
+            Action::Quit => ctx.quit(),
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),
@@ -410,36 +438,77 @@ impl<T: EventListener> Execute<T> for Action {
             Action::CreateNewWindow => ctx.create_new_window(None),
             #[cfg(target_os = "macos")]
             Action::CreateNewTab => {
-                // Tabs on macOS are not possible without decorations.
-                if ctx.config().window.decorations != Decorations::None {
-                    let tabbing_id = Some(ctx.window().tabbing_id());
-                    ctx.create_new_window(tabbing_id);
+                match ctx.config().window.tabs.mode {
+                    TabsMode::Compact => ctx.create_internal_tab(),
+                    TabsMode::Native => {
+                        // Tabs on macOS are not possible without decorations.
+                        if ctx.config().window.decorations != Decorations::None {
+                            let tabbing_id = Some(ctx.window().tabbing_id());
+                            ctx.create_new_window(tabbing_id);
+                        }
+                    },
                 }
             },
             #[cfg(target_os = "macos")]
-            Action::SelectNextTab => ctx.window().select_next_tab(),
+            Action::SelectNextTab => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_next_internal_tab(),
+                TabsMode::Native => ctx.window().select_next_tab(),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectPreviousTab => ctx.window().select_previous_tab(),
+            Action::SelectPreviousTab => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_previous_internal_tab(),
+                TabsMode::Native => ctx.window().select_previous_tab(),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab1 => ctx.window().select_tab_at_index(0),
+            Action::SelectTab1 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(0),
+                TabsMode::Native => ctx.window().select_tab_at_index(0),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab2 => ctx.window().select_tab_at_index(1),
+            Action::SelectTab2 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(1),
+                TabsMode::Native => ctx.window().select_tab_at_index(1),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab3 => ctx.window().select_tab_at_index(2),
+            Action::SelectTab3 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(2),
+                TabsMode::Native => ctx.window().select_tab_at_index(2),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab4 => ctx.window().select_tab_at_index(3),
+            Action::SelectTab4 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(3),
+                TabsMode::Native => ctx.window().select_tab_at_index(3),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab5 => ctx.window().select_tab_at_index(4),
+            Action::SelectTab5 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(4),
+                TabsMode::Native => ctx.window().select_tab_at_index(4),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab6 => ctx.window().select_tab_at_index(5),
+            Action::SelectTab6 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(5),
+                TabsMode::Native => ctx.window().select_tab_at_index(5),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab7 => ctx.window().select_tab_at_index(6),
+            Action::SelectTab7 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(6),
+                TabsMode::Native => ctx.window().select_tab_at_index(6),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab8 => ctx.window().select_tab_at_index(7),
+            Action::SelectTab8 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(7),
+                TabsMode::Native => ctx.window().select_tab_at_index(7),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab9 => ctx.window().select_tab_at_index(8),
+            Action::SelectTab9 => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_internal_tab(8),
+                TabsMode::Native => ctx.window().select_tab_at_index(8),
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectLastTab => ctx.window().select_last_tab(),
+            Action::SelectLastTab => match ctx.config().window.tabs.mode {
+                TabsMode::Compact => ctx.select_last_internal_tab(),
+                TabsMode::Native => ctx.window().select_last_tab(),
+            },
             _ => (),
         }
     }
@@ -651,6 +720,13 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
 
             if let MouseButton::Left = button {
+                let mouse = self.ctx.mouse();
+                if let Some(_tab_index) = self.ctx.tab_bar_hit_test(mouse.x, mouse.y) {
+                    #[cfg(target_os = "macos")]
+                    self.ctx.select_internal_tab(_tab_index);
+                    return;
+                }
+
                 self.on_left_click(point)
             }
         }
@@ -713,7 +789,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
         self.ctx.display().highlighted_hint = hint;
 
-        let timer_id = TimerId::new(Topic::SelectionScrolling, self.ctx.window().id());
+        let timer_id = TimerId::new(
+            Topic::SelectionScrolling,
+            self.ctx.window().id(),
+            self.ctx.scheduler_tab_id(),
+        );
         self.ctx.scheduler_mut().unschedule(timer_id);
 
         if let MouseButton::Left | MouseButton::Right = button {
@@ -1094,6 +1174,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Icon state of the cursor.
     fn cursor_state(&mut self) -> CursorIcon {
+        let mouse = self.ctx.mouse();
+        if self.ctx.tab_bar_hit_test(mouse.x, mouse.y).is_some() {
+            return CursorIcon::Pointer;
+        }
+
         let display_offset = self.ctx.terminal().grid().display_offset();
         let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
         let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
@@ -1117,6 +1202,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let scale_factor = self.ctx.window().scale_factor;
         let size = self.ctx.size_info();
         let window_id = self.ctx.window().id();
+        let tab_id = self.ctx.scheduler_tab_id();
         let scheduler = self.ctx.scheduler_mut();
 
         // Scale constants by DPI.
@@ -1134,15 +1220,19 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         } else if mouse_y >= start_bottom {
             start_bottom - mouse_y - step
         } else {
-            scheduler.unschedule(TimerId::new(Topic::SelectionScrolling, window_id));
+            scheduler.unschedule(TimerId::new(Topic::SelectionScrolling, window_id, tab_id));
             return;
         };
 
         // Scale number of lines scrolled based on distance to boundary.
-        let event = Event::new(EventType::Scroll(Scroll::Delta(delta / step)), Some(window_id));
+        let event = Event::new_with_tab(
+            EventType::Scroll(Scroll::Delta(delta / step)),
+            Some(window_id),
+            tab_id,
+        );
 
         // Schedule event.
-        let timer_id = TimerId::new(Topic::SelectionScrolling, window_id);
+        let timer_id = TimerId::new(Topic::SelectionScrolling, window_id, tab_id);
         scheduler.unschedule(timer_id);
         scheduler.schedule(event, SELECTION_SCROLLING_INTERVAL, true, timer_id);
     }

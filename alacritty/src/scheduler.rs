@@ -13,11 +13,12 @@ use crate::event::Event;
 pub struct TimerId {
     topic: Topic,
     window_id: WindowId,
+    tab_id: Option<crate::tabs::TabId>,
 }
 
 impl TimerId {
-    pub fn new(topic: Topic, window_id: WindowId) -> Self {
-        Self { topic, window_id }
+    pub fn new(topic: Topic, window_id: WindowId, tab_id: Option<crate::tabs::TabId>) -> Self {
+        Self { topic, window_id, tab_id }
     }
 }
 
@@ -106,5 +107,11 @@ impl Scheduler {
     /// stick around forever and cause a memory leak.
     pub fn unschedule_window(&mut self, window_id: WindowId) {
         self.timers.retain(|timer| timer.id.window_id != window_id);
+    }
+
+    /// Remove all timers scheduled for a tab in the specified window.
+    pub fn unschedule_tab(&mut self, window_id: WindowId, tab_id: crate::tabs::TabId) {
+        self.timers
+            .retain(|timer| timer.id.window_id != window_id || timer.id.tab_id != Some(tab_id));
     }
 }

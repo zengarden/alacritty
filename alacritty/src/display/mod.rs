@@ -32,28 +32,30 @@ use alacritty_terminal::index::{Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{
-    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
+    self, LineDamageBounds, Term, TermDamage, TermMode, MIN_COLUMNS, MIN_SCREEN_LINES,
 };
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
-use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
 use crate::config::font::Font;
-use crate::config::window::Dimensions;
+#[cfg(target_os = "macos")]
+use crate::config::window::Decorations;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
+use crate::config::window::{Dimensions, TabsMode};
+use crate::config::UiConfig;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
-use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
+use crate::display::damage::{damage_y_to_viewport_y, DamageTracker};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
-use crate::renderer::{self, GlyphCache, Renderer, platform};
+use crate::renderer::{self, platform, GlyphCache, Renderer};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 
@@ -75,6 +77,28 @@ const BACKWARD_SEARCH_LABEL: &str = "Backward Search: ";
 
 /// The character used to shorten the visible text like uri preview or search regex.
 const SHORTENER: char = '…';
+
+/// Horizontal spaces around each compact tab title.
+const COMPACT_TAB_SIDE_PADDING: usize = 1;
+
+/// Spacing between compact tabs.
+const COMPACT_TAB_GAP_COLUMNS: usize = 1;
+
+/// Reserved left area for macOS traffic-light buttons in compact mode.
+#[cfg(target_os = "macos")]
+const MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH: f32 = 86.;
+
+/// Approximate native titlebar height in macOS compact mode.
+#[cfg(target_os = "macos")]
+const MACOS_COMPACT_TITLEBAR_HEIGHT: f32 = 30.;
+
+/// Extra gap between macOS compact tabs and terminal content.
+#[cfg(target_os = "macos")]
+const MACOS_COMPACT_CONTENT_GAP: f32 = 0.;
+
+/// Optical baseline shift for compact tab titles to align with traffic lights.
+#[cfg(target_os = "macos")]
+const MACOS_COMPACT_LABEL_BASELINE_SHIFT: f32 = 1.;
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
@@ -338,6 +362,29 @@ impl DisplayUpdate {
     }
 }
 
+/// Data required to render one compact tab item.
+#[derive(Clone, Debug)]
+pub struct TabBarEntry {
+    pub title: String,
+    pub is_active: bool,
+}
+
+/// Compact tab geometry for stable slot-based layout.
+#[derive(Copy, Clone, Debug)]
+struct CompactTabLayout {
+    start_column: usize,
+    visible_tabs: usize,
+    slot_width: usize,
+    wide_slots: usize,
+}
+
+impl CompactTabLayout {
+    #[inline]
+    fn slot_width_at(&self, index: usize) -> usize {
+        self.slot_width + usize::from(index < self.wide_slots)
+    }
+}
+
 /// The display wraps a window, font rasterizer, and GPU renderer.
 pub struct Display {
     pub window: Window,
@@ -444,7 +491,7 @@ impl Display {
             glyph_cache.reset_glyph_cache(&mut api);
         });
 
-        let padding = config.window.padding(window.scale_factor as f32);
+        let padding = effective_window_padding(config, window.scale_factor as f32);
         let viewport_size = window.inner_size();
 
         // Create new size with at least one column and row.
@@ -455,7 +502,9 @@ impl Display {
             cell_height,
             padding.0,
             padding.1,
-            config.window.dynamic_padding && config.window.dimensions().is_none(),
+            config.window.dynamic_padding
+                && config.window.dimensions().is_none()
+                && !matches!(config.window.tabs.mode, TabsMode::Compact),
         );
 
         info!("Cell size: {cell_width} x {cell_height}");
@@ -547,6 +596,241 @@ impl Display {
         &self.context
     }
 
+    #[inline]
+    fn compact_tab_lines(&self, config: &UiConfig, size_info: &SizeInfo) -> usize {
+        if !matches!(config.window.tabs.mode, TabsMode::Compact) {
+            return 0;
+        }
+
+        let visual_height = self.compact_tab_bar_height(config, size_info);
+        let lines = (visual_height / size_info.cell_height()).ceil() as usize;
+        lines.max(1)
+    }
+
+    #[inline]
+    fn compact_tab_top_inset(&self, config: &UiConfig, size_info: &SizeInfo) -> f32 {
+        let top_lines = self.compact_tab_lines(config, size_info);
+        top_lines as f32 * size_info.cell_height()
+    }
+
+    #[inline]
+    fn mix_rgb(base: Rgb, overlay: Rgb, overlay_weight: f32) -> Rgb {
+        base * (1. - overlay_weight) + overlay * overlay_weight
+    }
+
+    #[inline]
+    fn compact_tab_bar_background(config: &UiConfig) -> Rgb {
+        config.colors.primary.background
+    }
+
+    #[inline]
+    fn compact_tab_active_foreground(config: &UiConfig) -> Rgb {
+        config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground)
+    }
+
+    #[inline]
+    fn compact_tab_inactive_foreground(config: &UiConfig) -> Rgb {
+        Self::mix_rgb(config.colors.primary.foreground, config.colors.primary.background, 0.35)
+    }
+
+    #[inline]
+    fn compact_tab_visual_height(&self, config: &UiConfig, size_info: &SizeInfo) -> f32 {
+        if !matches!(config.window.tabs.mode, TabsMode::Compact) {
+            return 0.;
+        }
+
+        let cell_height = size_info.cell_height();
+
+        #[cfg(target_os = "macos")]
+        {
+            if !matches!(config.window.decorations, Decorations::None) {
+                let native_height =
+                    self.window.titlebar_height().unwrap_or(MACOS_COMPACT_TITLEBAR_HEIGHT);
+                return cell_height.max(native_height);
+            }
+        }
+
+        cell_height
+    }
+
+    #[inline]
+    fn compact_tab_bar_height(&self, config: &UiConfig, size_info: &SizeInfo) -> f32 {
+        let height = self.compact_tab_visual_height(config, size_info);
+
+        #[cfg(target_os = "macos")]
+        {
+            if height > 0. && !matches!(config.window.decorations, Decorations::None) {
+                return height + MACOS_COMPACT_CONTENT_GAP;
+            }
+        }
+
+        height
+    }
+
+    #[inline]
+    fn compact_tab_label_padding_y(&self, config: &UiConfig, size_info: &SizeInfo) -> f32 {
+        let bar_height = self.compact_tab_visual_height(config, size_info);
+        let mut padding_y = size_info.padding_y() + ((bar_height - size_info.cell_height()) * 0.5).max(0.);
+
+        #[cfg(target_os = "macos")]
+        {
+            if matches!(config.window.tabs.mode, TabsMode::Compact)
+                && !matches!(config.window.decorations, Decorations::None)
+            {
+                padding_y += MACOS_COMPACT_LABEL_BASELINE_SHIFT;
+            }
+        }
+
+        padding_y
+    }
+
+    #[inline]
+    fn compact_tab_start_column(config: &UiConfig, size_info: &SizeInfo) -> usize {
+        #[cfg(target_os = "macos")]
+        {
+            if !matches!(config.window.tabs.mode, TabsMode::Compact) {
+                return 0;
+            }
+
+            // Reserve space for traffic-light buttons whenever they are visible.
+            if matches!(config.window.decorations, Decorations::Buttonless | Decorations::None) {
+                return 0;
+            }
+
+            let reserve = (MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH / size_info.cell_width()).ceil();
+            return reserve as usize;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (config, size_info);
+            0
+        }
+    }
+
+    #[inline]
+    fn compact_tab_layout(
+        &self,
+        config: &UiConfig,
+        size_info: &SizeInfo,
+        tab_count: usize,
+    ) -> Option<CompactTabLayout> {
+        if tab_count == 0 {
+            return None;
+        }
+
+        let columns = size_info.columns();
+        let start_column = Self::compact_tab_start_column(config, size_info).min(columns);
+        if start_column >= columns {
+            return None;
+        }
+
+        let total_columns = columns - start_column;
+        let min_slot_width = COMPACT_TAB_SIDE_PADDING * 2 + 1;
+        let mut visible_tabs = tab_count.min(total_columns.max(1));
+
+        while visible_tabs > 0 {
+            let total_gap_width = COMPACT_TAB_GAP_COLUMNS * visible_tabs.saturating_sub(1);
+            if total_columns <= total_gap_width {
+                visible_tabs -= 1;
+                continue;
+            }
+
+            let tabs_columns = total_columns - total_gap_width;
+            let slot_width = tabs_columns / visible_tabs;
+            if slot_width < min_slot_width {
+                visible_tabs -= 1;
+                continue;
+            }
+
+            let wide_slots = tabs_columns % visible_tabs;
+            return Some(CompactTabLayout {
+                start_column,
+                visible_tabs,
+                slot_width,
+                wide_slots,
+            });
+        }
+
+        None
+    }
+
+    #[inline]
+    pub fn terminal_size_info(&self, config: &UiConfig) -> SizeInfo {
+        let mut size_info = self.size_info;
+        let top_lines = self.compact_tab_lines(config, &size_info);
+        if top_lines != 0 {
+            let top_inset = self.compact_tab_top_inset(config, &size_info);
+            size_info.padding_y += top_inset;
+            size_info.height += top_inset;
+        }
+
+        size_info
+    }
+
+    #[inline]
+    fn terminal_render_size_info(
+        &self,
+        config: &UiConfig,
+        terminal_screen_lines: usize,
+        bottom_reserved_lines: usize,
+    ) -> SizeInfo {
+        let mut size_info = self.size_info;
+        size_info.screen_lines = terminal_screen_lines;
+        if matches!(config.window.tabs.mode, TabsMode::Compact) {
+            let render_lines = terminal_screen_lines + bottom_reserved_lines;
+            size_info.height =
+                2. * size_info.padding_y() + render_lines as f32 * size_info.cell_height();
+        }
+
+        size_info
+    }
+
+    /// Return compact tab index at the given pixel position.
+    pub fn compact_tab_at_position(
+        &self,
+        config: &UiConfig,
+        tab_bar_entries: &[TabBarEntry],
+        x: usize,
+        y: usize,
+    ) -> Option<usize> {
+        if tab_bar_entries.is_empty() {
+            return None;
+        }
+
+        let top = self.size_info.padding_y() as usize;
+        let bottom = (self.size_info.padding_y()
+            + self.compact_tab_bar_height(config, &self.size_info)) as usize;
+        if y < top || y > bottom {
+            return None;
+        }
+
+        let left = self.size_info.padding_x() as usize;
+        if x <= left {
+            return None;
+        }
+
+        let cell_width = self.size_info.cell_width() as usize;
+        let columns = self.size_info.columns();
+        let column = (x - left) / cell_width;
+        if column >= columns {
+            return None;
+        }
+
+        let layout = self.compact_tab_layout(config, &self.size_info, tab_bar_entries.len())?;
+        let mut start = layout.start_column;
+        for index in 0..layout.visible_tabs {
+            let width = layout.slot_width_at(index);
+            if (start..start + width).contains(&column) {
+                return Some(index);
+            }
+
+            start += width + COMPACT_TAB_GAP_COLUMNS;
+        }
+
+        None
+    }
+
     pub fn make_not_current(&mut self) {
         if self.context.is_current() {
             self.context.make_not_current_in_place().expect("failed to disable context");
@@ -604,7 +888,7 @@ impl Display {
         debug!("Recovered window {:?} from gpu reset", self.window.id());
     }
 
-    fn swap_buffers(&self) {
+    fn swap_buffers(&self, _damage_size_info: SizeInfo<u32>) {
         #[allow(clippy::single_match)]
         let res = match (self.surface.deref(), &self.context.deref()) {
             #[cfg(not(any(target_os = "macos", windows)))]
@@ -612,7 +896,7 @@ impl Display {
                 if matches!(self.raw_window_handle, RawWindowHandle::Wayland(_))
                     && !self.damage_tracker.debug =>
             {
-                let damage = self.damage_tracker.shape_frame_damage(self.size_info.into());
+                let damage = self.damage_tracker.shape_frame_damage(_damage_size_info);
                 surface.swap_buffers_with_damage(context, &damage)
             },
             (surface, context) => surface.swap_buffers(context),
@@ -687,7 +971,7 @@ impl Display {
             height = dimensions.height as f32;
         }
 
-        let padding = config.window.padding(self.window.scale_factor as f32);
+        let padding = effective_window_padding(config, self.window.scale_factor as f32);
 
         let mut new_size = SizeInfo::new(
             width,
@@ -696,14 +980,15 @@ impl Display {
             cell_height,
             padding.0,
             padding.1,
-            config.window.dynamic_padding,
+            config.window.dynamic_padding && !matches!(config.window.tabs.mode, TabsMode::Compact),
         );
 
         // Update number of column/lines in the viewport.
         let search_active = search_state.history_index.is_some();
         let message_bar_lines = message_buffer.message().map_or(0, |m| m.text(&new_size).len());
         let search_lines = usize::from(search_active);
-        new_size.reserve_lines(message_bar_lines + search_lines);
+        let tab_bar_lines = self.compact_tab_lines(config, &new_size);
+        new_size.reserve_lines(message_bar_lines + search_lines + tab_bar_lines);
 
         // Update resize increments.
         if config.window.resize_increments {
@@ -777,6 +1062,7 @@ impl Display {
         mut terminal: MutexGuard<'_, Term<T>>,
         scheduler: &mut Scheduler,
         message_buffer: &MessageBuffer,
+        tab_bar_entries: &[TabBarEntry],
         config: &UiConfig,
         search_state: &mut SearchState,
     ) {
@@ -791,11 +1077,18 @@ impl Display {
         let background_color = content.color(NamedColor::Background as usize);
         let display_offset = content.display_offset();
         let cursor = content.cursor();
+        let terminal_screen_lines = terminal.screen_lines();
 
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
+        let message_lines = message_buffer.message().map_or(0, |message| message.text(&size_info).len());
+        let search_lines = usize::from(search_state.history_index.is_some());
+        let bottom_reserved_lines = message_lines + search_lines;
+        let terminal_size_info =
+            self.terminal_render_size_info(config, terminal_screen_lines, bottom_reserved_lines);
+        let top_bar_lines = self.compact_tab_lines(config, &size_info);
 
         let vi_mode = terminal.mode().contains(TermMode::VI);
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
@@ -846,9 +1139,8 @@ impl Display {
         {
             let _sampler = self.meter.sampler();
 
-            // Ensure macOS hasn't reset our viewport.
-            #[cfg(target_os = "macos")]
-            self.renderer.set_viewport(&size_info);
+            // Keep text projection and viewport in sync with terminal geometry.
+            self.renderer.resize(&terminal_size_info);
 
             let glyph_cache = &mut self.glyph_cache;
             let highlighted_hint = &self.highlighted_hint;
@@ -875,25 +1167,38 @@ impl Display {
 
                 cell
             });
-            self.renderer.draw_cells(&size_info, glyph_cache, cells);
+            self.renderer.draw_cells(&terminal_size_info, glyph_cache, cells);
         }
 
-        let mut rects = lines.rects(&metrics, &size_info);
+        let mut terminal_rects = lines.rects(&metrics, &terminal_size_info);
+        let mut ui_rects = Vec::new();
 
         if let Some(vi_cursor_point) = vi_cursor_point {
             // Indicate vi mode by showing the cursor's position in the top right corner.
-            let line = (-vi_cursor_point.line.0 + size_info.bottommost_line().0) as usize;
+            let line = (-vi_cursor_point.line.0 + terminal_size_info.bottommost_line().0) as usize;
             let obstructed_column = Some(vi_cursor_point)
                 .filter(|point| point.line == -(display_offset as i32))
                 .map(|point| point.column);
-            self.draw_line_indicator(config, total_lines, obstructed_column, line);
+            self.draw_line_indicator(
+                config,
+                &terminal_size_info,
+                total_lines,
+                obstructed_column,
+                line,
+            );
         } else if search_state.regex().is_some() {
             // Show current display offset in vi-less search to indicate match position.
-            self.draw_line_indicator(config, total_lines, None, display_offset);
+            self.draw_line_indicator(
+                config,
+                &terminal_size_info,
+                total_lines,
+                None,
+                display_offset,
+            );
         };
 
         // Draw cursor.
-        rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+        terminal_rects.extend(cursor.rects(&terminal_size_info, config.cursor.thickness()));
 
         // Push visual bell after url/underline/strikeout rects.
         let visual_bell_intensity = self.visual_bell.intensity();
@@ -906,12 +1211,14 @@ impl Display {
                 config.bell.color,
                 visual_bell_intensity as f32,
             );
-            rects.push(visual_bell_rect);
+            ui_rects.push(visual_bell_rect);
         }
 
         // Handle IME positioning and search bar rendering.
         let ime_position = match search_state.regex() {
             Some(regex) => {
+                self.renderer.resize(&size_info);
+
                 let search_label = match search_state.direction() {
                     Direction::Right => FORWARD_SEARCH_LABEL,
                     Direction::Left => BACKWARD_SEARCH_LABEL,
@@ -920,10 +1227,10 @@ impl Display {
                 let search_text = Self::format_search(regex, search_label, size_info.columns());
 
                 // Render the search bar.
-                self.draw_search(config, &search_text);
+                let line = top_bar_lines + size_info.screen_lines();
+                self.draw_search(config, &size_info, line, &search_text);
 
                 // Draw search bar cursor.
-                let line = size_info.screen_lines();
                 let column = Column(search_text.chars().count() - 1);
 
                 // Add cursor to search bar if IME is not active.
@@ -933,32 +1240,52 @@ impl Display {
                     let cursor_width = NonZeroU32::new(1).unwrap();
                     let cursor =
                         RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
-                    rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
+                    ui_rects.extend(cursor.rects(&size_info, config.cursor.thickness()));
                 }
 
-                Some(Point::new(line, column))
+                Some((Point::new(line, column), true))
             },
             None => {
-                let num_lines = self.size_info.screen_lines();
+                let num_lines = terminal_size_info.screen_lines();
                 match vi_cursor_viewport_point {
                     None => term::point_to_viewport(display_offset, cursor_point)
                         .filter(|point| point.line < num_lines),
                     point => point,
                 }
+                .map(|point| (point, false))
             },
         };
 
         // Handle IME.
         if self.ime.is_enabled() {
-            if let Some(point) = ime_position {
+            if let Some((point, search_bar)) = ime_position {
                 let (fg, bg) = if search_state.regex().is_some() {
                     (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
                 } else {
                     (foreground_color, background_color)
                 };
 
-                self.draw_ime_preview(point, fg, bg, &mut rects, config);
+                let ime_size_info = if search_bar { &size_info } else { &terminal_size_info };
+                let rects = if search_bar { &mut ui_rects } else { &mut terminal_rects };
+                self.draw_ime_preview(point, fg, bg, ime_size_info, rects, config);
             }
+        }
+
+        self.renderer.resize(&size_info);
+
+        if top_bar_lines != 0 {
+            let y = size_info.padding_y();
+            let width = size_info.width() as i32;
+            let height = self.compact_tab_bar_height(config, &size_info) as i32;
+            let bg = Self::compact_tab_bar_background(config);
+            let tab_bar_rect = RenderRect::new(0., y, width as f32, height as f32, bg, 1.);
+            ui_rects.push(tab_bar_rect);
+
+            // Always damage tab bar in compact mode to keep updates deterministic.
+            self.damage_tracker.frame().add_viewport_rect(&size_info, 0, y as i32, width, height);
+            self.damage_tracker
+                .next_frame()
+                .add_viewport_rect(&size_info, 0, y as i32, width, height);
         }
 
         if let Some(message) = message_buffer.message() {
@@ -966,7 +1293,7 @@ impl Display {
             let text = message.text(&size_info);
 
             // Create a new rectangle for the background.
-            let start_line = size_info.screen_lines() + search_offset;
+            let start_line = top_bar_lines + size_info.screen_lines() + search_offset;
             let y = size_info.cell_height().mul_add(start_line as f32, size_info.padding_y());
 
             let bg = match message.ty() {
@@ -981,13 +1308,17 @@ impl Display {
                 RenderRect::new(x as f32, y, width as f32, height as f32, bg, 1.);
 
             // Push message_bar in the end, so it'll be above all other content.
-            rects.push(message_bar_rect);
+            ui_rects.push(message_bar_rect);
 
             // Always damage message bar, since it could have messages of the same size in it.
             self.damage_tracker.frame().add_viewport_rect(&size_info, x, y as i32, width, height);
 
-            // Draw rectangles.
-            self.renderer.draw_rects(&size_info, &metrics, rects);
+            if !terminal_rects.is_empty() {
+                self.renderer.draw_rects(&terminal_size_info, &metrics, terminal_rects);
+            }
+            if !ui_rects.is_empty() {
+                self.renderer.draw_rects(&size_info, &metrics, ui_rects);
+            }
 
             // Relay messages to the user.
             let glyph_cache = &mut self.glyph_cache;
@@ -1004,16 +1335,26 @@ impl Display {
                 );
             }
         } else {
-            // Draw rectangles.
-            self.renderer.draw_rects(&size_info, &metrics, rects);
+            if !terminal_rects.is_empty() {
+                self.renderer.draw_rects(&terminal_size_info, &metrics, terminal_rects);
+            }
+            if !ui_rects.is_empty() {
+                self.renderer.draw_rects(&size_info, &metrics, ui_rects);
+            }
         }
 
-        self.draw_render_timer(config);
+        if top_bar_lines != 0 {
+            self.renderer.resize(&size_info);
+            self.draw_tab_bar(config, &size_info, tab_bar_entries);
+        }
+
+        self.renderer.resize(&terminal_size_info);
+        self.draw_render_timer(config, &terminal_size_info);
 
         // Draw hyperlink uri preview.
         if has_highlighted_hint {
             let cursor_point = vi_cursor_point.or(Some(cursor_point));
-            self.draw_hyperlink_preview(config, cursor_point, display_offset);
+            self.draw_hyperlink_preview(config, &terminal_size_info, cursor_point, display_offset);
         }
 
         // Notify winit that we're about to present.
@@ -1021,14 +1362,14 @@ impl Display {
 
         // Highlight damage for debugging.
         if self.damage_tracker.debug {
-            let damage = self.damage_tracker.shape_frame_damage(self.size_info.into());
+            let damage = self.damage_tracker.shape_frame_damage(terminal_size_info.into());
             let mut rects = Vec::with_capacity(damage.len());
-            self.highlight_damage(&mut rects);
-            self.renderer.draw_rects(&self.size_info, &metrics, rects);
+            self.highlight_damage(&terminal_size_info, &mut rects);
+            self.renderer.draw_rects(&terminal_size_info, &metrics, rects);
         }
 
         // Clearing debug highlights from the previous frame requires full redraw.
-        self.swap_buffers();
+        self.swap_buffers(terminal_size_info.into());
 
         if matches!(self.raw_window_handle, RawWindowHandle::Xcb(_) | RawWindowHandle::Xlib(_)) {
             // On X11 `swap_buffers` does not block for vsync. However the next OpenGl command
@@ -1093,7 +1434,8 @@ impl Display {
         }
 
         // Find highlighted hint at mouse position.
-        let point = mouse.point(&self.size_info, term.grid().display_offset());
+        let size_info = self.terminal_size_info(config);
+        let point = mouse.point(&size_info, term.grid().display_offset());
         let highlighted_hint = hint::highlighted_at(term, config, point, modifiers);
 
         // Update cursor shape.
@@ -1131,6 +1473,7 @@ impl Display {
         point: Point<usize>,
         fg: Rgb,
         bg: Rgb,
+        size_info: &SizeInfo,
         rects: &mut Vec<RenderRect>,
         config: &UiConfig,
     ) {
@@ -1138,12 +1481,12 @@ impl Display {
             Some(preedit) => preedit,
             None => {
                 // In case we don't have preedit, just set the popup point.
-                self.window.update_ime_position(point, &self.size_info);
+                self.window.update_ime_position(point, size_info);
                 return;
             },
         };
 
-        let num_cols = self.size_info.columns();
+        let num_cols = size_info.columns();
 
         // Get the visible preedit.
         let visible_text: String = match (preedit.cursor_byte_offset, preedit.cursor_end_offset) {
@@ -1170,17 +1513,10 @@ impl Display {
         let glyph_cache = &mut self.glyph_cache;
         let metrics = glyph_cache.font_metrics();
 
-        self.renderer.draw_string(
-            start,
-            fg,
-            bg,
-            visible_text.chars(),
-            &self.size_info,
-            glyph_cache,
-        );
+        self.renderer.draw_string(start, fg, bg, visible_text.chars(), size_info, glyph_cache);
 
         // Damage preedit inside the terminal viewport.
-        if point.line < self.size_info.screen_lines() {
+        if point.line < size_info.screen_lines() {
             let damage = LineDamageBounds::new(start.line, 0, num_cols);
             self.damage_tracker.frame().damage_line(damage);
             self.damage_tracker.next_frame().damage_line(damage);
@@ -1188,7 +1524,7 @@ impl Display {
 
         // Add underline for preedit text.
         let underline = RenderLine { start, end, color: fg };
-        rects.extend(underline.rects(Flags::UNDERLINE, &metrics, &self.size_info));
+        rects.extend(underline.rects(Flags::UNDERLINE, &metrics, size_info));
 
         let ime_popup_point = match preedit.cursor_end_offset {
             Some(cursor_end_offset) => {
@@ -1206,13 +1542,13 @@ impl Display {
                 );
                 let cursor_point = Point::new(point.line, cursor_column);
                 let cursor = RenderableCursor::new(cursor_point, shape, fg, width);
-                rects.extend(cursor.rects(&self.size_info, config.cursor.thickness()));
+                rects.extend(cursor.rects(size_info, config.cursor.thickness()));
                 cursor_point
             },
             _ => end,
         };
 
-        self.window.update_ime_position(ime_popup_point, &self.size_info);
+        self.window.update_ime_position(ime_popup_point, size_info);
     }
 
     /// Format search regex to account for the cursor and fullwidth characters.
@@ -1244,10 +1580,11 @@ impl Display {
     fn draw_hyperlink_preview(
         &mut self,
         config: &UiConfig,
+        size_info: &SizeInfo,
         cursor_point: Option<Point>,
         display_offset: usize,
     ) {
-        let num_cols = self.size_info.columns();
+        let num_cols = size_info.columns();
         let uris: Vec<_> = self
             .highlighted_hint
             .iter()
@@ -1265,7 +1602,7 @@ impl Display {
 
         // Lines we shouldn't show preview on, because it'll obscure the highlighted hint.
         let mut protected_lines = Vec::with_capacity(max_protected_lines);
-        if self.size_info.screen_lines() > max_protected_lines {
+        if size_info.screen_lines() > max_protected_lines {
             // Prefer to show preview even when it'll likely obscure the highlighted hint, when
             // there's no place left for it.
             protected_lines.push(self.hint_mouse_point.map(|point| point.line));
@@ -1273,8 +1610,8 @@ impl Display {
         }
 
         // Find the line in viewport we can draw preview on without obscuring protected lines.
-        let viewport_bottom = self.size_info.bottommost_line() - Line(display_offset as i32);
-        let viewport_top = viewport_bottom - (self.size_info.screen_lines() - 1);
+        let viewport_bottom = size_info.bottommost_line() - Line(display_offset as i32);
+        let viewport_top = viewport_bottom - (size_info.screen_lines() - 1);
         let uri_lines = (viewport_top.0..=viewport_bottom.0)
             .rev()
             .map(|line| Some(Line(line)))
@@ -1299,41 +1636,34 @@ impl Display {
             // Damage the uri preview for the next frame as well.
             self.damage_tracker.next_frame().damage_line(damage);
 
-            self.renderer.draw_string(point, fg, bg, uri, &self.size_info, &mut self.glyph_cache);
+            self.renderer.draw_string(point, fg, bg, uri, size_info, &mut self.glyph_cache);
         }
     }
 
     /// Draw current search regex.
     #[inline(never)]
-    fn draw_search(&mut self, config: &UiConfig, text: &str) {
+    fn draw_search(&mut self, config: &UiConfig, size_info: &SizeInfo, line: usize, text: &str) {
         // Assure text length is at least num_cols.
-        let num_cols = self.size_info.columns();
+        let num_cols = size_info.columns();
         let text = format!("{text:<num_cols$}");
 
-        let point = Point::new(self.size_info.screen_lines(), Column(0));
+        let point = Point::new(line, Column(0));
 
         let fg = config.colors.footer_bar_foreground();
         let bg = config.colors.footer_bar_background();
 
-        self.renderer.draw_string(
-            point,
-            fg,
-            bg,
-            text.chars(),
-            &self.size_info,
-            &mut self.glyph_cache,
-        );
+        self.renderer.draw_string(point, fg, bg, text.chars(), size_info, &mut self.glyph_cache);
     }
 
     /// Draw render timer.
     #[inline(never)]
-    fn draw_render_timer(&mut self, config: &UiConfig) {
+    fn draw_render_timer(&mut self, config: &UiConfig, size_info: &SizeInfo) {
         if !config.debug.render_timer {
             return;
         }
 
         let timing = format!("{:.3} usec", self.meter.average());
-        let point = Point::new(self.size_info.screen_lines().saturating_sub(2), Column(0));
+        let point = Point::new(size_info.screen_lines().saturating_sub(2), Column(0));
         let fg = config.colors.primary.background;
         let bg = config.colors.normal.red;
 
@@ -1343,7 +1673,7 @@ impl Display {
         self.damage_tracker.next_frame().damage_line(damage);
 
         let glyph_cache = &mut self.glyph_cache;
-        self.renderer.draw_string(point, fg, bg, timing.chars(), &self.size_info, glyph_cache);
+        self.renderer.draw_string(point, fg, bg, timing.chars(), size_info, glyph_cache);
     }
 
     /// Draw an indicator for the position of a line in history.
@@ -1351,13 +1681,14 @@ impl Display {
     fn draw_line_indicator(
         &mut self,
         config: &UiConfig,
+        size_info: &SizeInfo,
         total_lines: usize,
         obstructed_column: Option<Column>,
         line: usize,
     ) {
-        let columns = self.size_info.columns();
+        let columns = size_info.columns();
         let text = format!("[{}/{}]", line, total_lines - 1);
-        let column = Column(self.size_info.columns().saturating_sub(text.len()));
+        let column = Column(size_info.columns().saturating_sub(text.len()));
         let point = Point::new(0, column);
 
         // Damage the line indicator for current and next frame.
@@ -1372,19 +1703,112 @@ impl Display {
         // Do not render anything if it would obscure the vi mode cursor.
         if obstructed_column.is_none_or(|obstructed_column| obstructed_column < column) {
             let glyph_cache = &mut self.glyph_cache;
-            self.renderer.draw_string(point, fg, bg, text.chars(), &self.size_info, glyph_cache);
+            self.renderer.draw_string(point, fg, bg, text.chars(), size_info, glyph_cache);
         }
+    }
+
+    /// Draw compact tab bar labels.
+    #[inline(never)]
+    fn draw_tab_bar(&mut self, config: &UiConfig, size_info: &SizeInfo, tabs: &[TabBarEntry]) {
+        if tabs.is_empty() {
+            return;
+        }
+
+        let layout = match self.compact_tab_layout(config, size_info, tabs.len()) {
+            Some(layout) => layout,
+            None => return,
+        };
+
+        let mut tab_size_info = *size_info;
+        tab_size_info.padding_y = self.compact_tab_label_padding_y(config, size_info);
+        self.renderer.resize(&tab_size_info);
+
+        let mut column = layout.start_column;
+        let mut active_label_bounds: Option<(usize, usize)> = None;
+
+        let bar_bg = Self::compact_tab_bar_background(config);
+        let active_fg = Self::compact_tab_active_foreground(config);
+        let inactive_fg = Self::compact_tab_inactive_foreground(config);
+        let inactive_bg = bar_bg;
+
+        for (index, tab) in tabs.iter().take(layout.visible_tabs).enumerate() {
+            if index > 0 {
+                let point = Point::new(0, Column(column));
+                let gap = " ".repeat(COMPACT_TAB_GAP_COLUMNS);
+                self.renderer.draw_string(
+                    point,
+                    inactive_fg,
+                    inactive_bg,
+                    gap.chars(),
+                    &tab_size_info,
+                    &mut self.glyph_cache,
+                );
+                column += COMPACT_TAB_GAP_COLUMNS;
+            }
+
+            let slot_width = layout.slot_width_at(index);
+            let inner_width = slot_width.saturating_sub(COMPACT_TAB_SIDE_PADDING * 2);
+            let title: String = StrShortener::new(
+                &tab.title,
+                inner_width,
+                ShortenDirection::Right,
+                Some(SHORTENER),
+            )
+            .collect();
+
+            let title_len = title.chars().count();
+            let centered_padding = inner_width.saturating_sub(title_len);
+            let left_extra_padding = centered_padding / 2;
+            let right_extra_padding = centered_padding - left_extra_padding;
+            let mut label = String::with_capacity(slot_width);
+            label.extend(std::iter::repeat(' ').take(COMPACT_TAB_SIDE_PADDING + left_extra_padding));
+            label.push_str(&title);
+            label.extend(
+                std::iter::repeat(' ')
+                    .take(COMPACT_TAB_SIDE_PADDING + right_extra_padding),
+            );
+
+            let point = Point::new(0, Column(column));
+            let (fg, bg) =
+                if tab.is_active { (active_fg, bar_bg) } else { (inactive_fg, inactive_bg) };
+            self.renderer.draw_string(
+                point,
+                fg,
+                bg,
+                label.chars(),
+                &tab_size_info,
+                &mut self.glyph_cache,
+            );
+            if tab.is_active {
+                active_label_bounds = Some((column, slot_width));
+            }
+            column += slot_width;
+        }
+
+        if let Some((start_column, len_columns)) = active_label_bounds {
+            let cell_width = size_info.cell_width();
+            let x = size_info.padding_x() + (start_column as f32 * cell_width);
+            let width = len_columns as f32 * cell_width;
+            let indicator_height = (size_info.cell_height() * 0.14).max(2.);
+            let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
+            let y = (bar_bottom - indicator_height).max(size_info.padding_y());
+            let indicator = RenderRect::new(x, y, width, indicator_height, active_fg, 1.);
+            self.renderer.draw_rects(size_info, &self.glyph_cache.font_metrics(), vec![indicator]);
+        }
+
+        // Restore the default text projection after compact tab-title rendering.
+        self.renderer.resize(size_info);
     }
 
     /// Highlight damaged rects.
     ///
     /// This function is for debug purposes only.
-    fn highlight_damage(&self, render_rects: &mut Vec<RenderRect>) {
-        for damage_rect in &self.damage_tracker.shape_frame_damage(self.size_info.into()) {
+    fn highlight_damage(&self, size_info: &SizeInfo, render_rects: &mut Vec<RenderRect>) {
+        for damage_rect in &self.damage_tracker.shape_frame_damage((*size_info).into()) {
             let x = damage_rect.x as f32;
             let height = damage_rect.height as f32;
             let width = damage_rect.width as f32;
-            let y = damage_y_to_viewport_y(&self.size_info, damage_rect) as f32;
+            let y = damage_y_to_viewport_y(size_info, damage_rect) as f32;
             let render_rect = RenderRect::new(x, y, width, height, DAMAGE_RECT_COLOR, 0.5);
 
             render_rects.push(render_rect);
@@ -1451,7 +1875,7 @@ impl Display {
         let swap_timeout = self.frame_timer.compute_timeout(monitor_vblank_interval);
 
         let window_id = self.window.id();
-        let timer_id = TimerId::new(Topic::Frame, window_id);
+        let timer_id = TimerId::new(Topic::Frame, window_id, None);
         let event = Event::new(EventType::Frame, window_id);
 
         scheduler.schedule(event, swap_timeout, false, timer_id);
@@ -1622,7 +2046,7 @@ fn window_size(
     cell_height: f32,
     scale_factor: f32,
 ) -> PhysicalSize<u32> {
-    let padding = config.window.padding(scale_factor);
+    let padding = effective_window_padding(config, scale_factor);
 
     let grid_width = cell_width * dimensions.columns.max(MIN_COLUMNS) as f32;
     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
@@ -1631,4 +2055,18 @@ fn window_size(
     let height = (padding.1).mul_add(2., grid_height).floor();
 
     PhysicalSize::new(width as u32, height as u32)
+}
+
+/// Effective window padding used for geometry and initial window size calculations.
+///
+/// Compact tab mode uses native titlebar space for top controls, so vertical terminal padding
+/// should not introduce additional bottom margin.
+#[inline]
+fn effective_window_padding(config: &UiConfig, scale_factor: f32) -> (f32, f32) {
+    let padding = config.window.padding(scale_factor);
+    if matches!(config.window.tabs.mode, TabsMode::Compact) {
+        (padding.0, 0.)
+    } else {
+        padding
+    }
 }
