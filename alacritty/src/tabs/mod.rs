@@ -231,4 +231,43 @@ mod tests {
         let id = TabId::new(7);
         assert_eq!(id.get(), 7);
     }
+
+    #[test]
+    fn tab_title_prefers_osc_over_fallback() {
+        let mut title = TabTitle::new(String::from("Shell"));
+
+        assert_eq!(title.display(), "Shell");
+        assert_eq!(title.osc(), None);
+
+        assert!(title.set_osc(String::from("nvim")));
+        assert_eq!(title.display(), "nvim");
+        assert_eq!(title.osc(), Some("nvim"));
+    }
+
+    #[test]
+    fn tab_title_set_osc_is_change_sensitive() {
+        let mut title = TabTitle::new(String::from("Shell"));
+
+        // Empty OSC title should normalize to no override.
+        assert!(!title.set_osc(String::from("  ")));
+        assert_eq!(title.display(), "Shell");
+
+        assert!(title.set_osc(String::from("logs")));
+        assert!(!title.set_osc(String::from("logs")));
+
+        // Whitespace OSC title should clear the override.
+        assert!(title.set_osc(String::from(" \t ")));
+        assert_eq!(title.osc(), None);
+        assert_eq!(title.display(), "Shell");
+    }
+
+    #[test]
+    fn tab_title_reset_osc_reports_changes() {
+        let mut title = TabTitle::new(String::from("Shell"));
+        assert!(!title.reset_osc());
+
+        assert!(title.set_osc(String::from("htop")));
+        assert!(title.reset_osc());
+        assert!(!title.reset_osc());
+    }
 }

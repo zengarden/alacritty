@@ -368,6 +368,32 @@ in Alacritty while keeping the default behavior stable.
   - Validation:
     - `cargo check -p alacritty`
     - `cargo test -p alacritty` (85 tests passed in current tree state)
+- 2026-02-17: PR-9 completed (docs consistency + regression coverage fill-in).
+  - Docs consistency updates:
+    - Updated `README.md` FAQ wording to reflect macOS tab support via
+      `window.tabs.mode = "Native" | "Compact"` (and clarified splits remain
+      out-of-scope).
+    - Added compact-tabs feature notes to `docs/features.md`.
+    - Added macOS compact-tab config snippet in `INSTALL.md`.
+  - Regression coverage updates:
+    - Added `tabs::tests` for `TabTitle` behavior:
+      OSC/fallback priority, change-sensitive updates, and reset semantics.
+    - Added `input::tests::cursor_state_clamps_point_for_stale_terminal_dimensions`
+      to guard the stale-size-info OOB path in cursor-state hyperlink lookup.
+  - Validation:
+    - `cargo test -p alacritty` (89 tests passed)
+- 2026-02-18: Bugfix (compact tab click bypasses terminal mouse mode).
+  - Symptom: after switching to a tab running mouse-capture apps (tmux/vim/etc),
+    clicking other compact tab titles could stop switching tabs.
+  - Root cause: `input::Processor::on_mouse_press` handled terminal mouse mode
+    before compact tab-bar hit-testing, so mouse-capture would intercept UI
+    clicks and only send PTY mouse reports.
+  - Fix:
+    - Always run compact tab-bar hit-testing first on macOS LMB press, and only
+      fall back to PTY mouse mode reporting when not clicking the tab bar.
+    - Added regression test `tab_bar_click_switches_even_in_mouse_mode`.
+  - Validation:
+    - `cargo test -p alacritty` (90 tests passed)
 
 ## Guardrails
 

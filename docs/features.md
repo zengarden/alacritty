@@ -82,3 +82,15 @@ that.
 Alacritty supports running multiple terminal emulators from the same Alacritty
 instance. New windows can be created either by using the `CreateNewWindow`
 keybinding action, or by executing the `alacritty msg create-window` subcommand.
+
+## Tabs on macOS
+
+On macOS, Alacritty supports two tab modes configured through
+`window.tabs.mode`:
+
+- `Native`: Use macOS native tabs.
+- `Compact`: Use Alacritty's compact in-window tab bar.
+
+In compact mode, built-in tab actions like creating tabs, selecting tabs, and
+closing the active tab are routed to internal tabs. Additional compact tuning
+options are available under `window.tabs.compact`.

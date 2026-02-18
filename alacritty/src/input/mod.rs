@@ -684,6 +684,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_press(&mut self, button: MouseButton) {
+        // Always allow interacting with the compact tab bar even when the terminal has mouse mode
+        // enabled (e.g. tmux/vim). The tab bar is a UI element and should not be captured by the
+        // PTY mouse protocol.
+        #[cfg(target_os = "macos")]
+        if let MouseButton::Left = button {
+            let mouse = self.ctx.mouse();
+            if let Some(tab_index) = self.ctx.tab_bar_hit_test(mouse.x, mouse.y) {
+                self.ctx.select_internal_tab(tab_index);
+                return;
+            }
+        }
+
         // Handle mouse mode.
         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
             self.ctx.mouse_mut().click_state = ClickState::None;
@@ -720,13 +732,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
 
             if let MouseButton::Left = button {
-                let mouse = self.ctx.mouse();
-                if let Some(_tab_index) = self.ctx.tab_bar_hit_test(mouse.x, mouse.y) {
-                    #[cfg(target_os = "macos")]
-                    self.ctx.select_internal_tab(_tab_index);
-                    return;
-                }
-
                 self.on_left_click(point)
             }
         }
@@ -770,6 +775,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     fn on_mouse_release(&mut self, button: MouseButton) {
+        // If the click is on the compact tab bar, don't emit PTY mouse reports on release.
+        #[cfg(target_os = "macos")]
+        if let MouseButton::Left = button {
+            let mouse = self.ctx.mouse();
+            if self.ctx.tab_bar_hit_test(mouse.x, mouse.y).is_some() {
+                return;
+            }
+        }
+
         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
             let code = match button {
                 MouseButton::Left => 0,
@@ -1253,7 +1267,7 @@ mod tests {
     use alacritty_terminal::event::Event as TerminalEvent;
 
     use crate::config::Binding;
-    use crate::message_bar::MessageBuffer;
+    use crate::message_bar::{Message, MessageBuffer, MessageType};
 
     const KEY: Key<&'static str> = Key::Character("0");
 
@@ -1457,6 +1471,191 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cursor_state_clamps_point_for_stale_terminal_dimensions() {
+        let mut clipboard = Clipboard::new_nop();
+        let cfg = UiConfig::default();
+        let stale_size = SizeInfo::new(100., 40., 10., 10., 0., 0., false);
+        let compact_size = SizeInfo::new(20., 40., 10., 10., 0., 0., false);
+
+        let mut terminal = Term::new(cfg.term_options(), &stale_size, MockEventProxy);
+        terminal.resize(compact_size);
+
+        // Keep cursor-state evaluation in message-bar branch to avoid display mock access.
+        let terminal_end = stale_size.padding_y() as usize
+            + stale_size.cell_height() as usize * stale_size.screen_lines();
+        let mut mouse = Mouse {
+            x: stale_size.width() as usize - 1,
+            y: terminal_end + 1,
+            ..Mouse::default()
+        };
+
+        let mut inline_search_state = InlineSearchState::default();
+        let mut message_buffer = MessageBuffer::default();
+        message_buffer.push(Message::new(String::from("oob guard"), MessageType::Warning));
+
+        let context = ActionContext {
+            terminal: &mut terminal,
+            mouse: &mut mouse,
+            size_info: &stale_size,
+            clipboard: &mut clipboard,
+            modifiers: Default::default(),
+            message_buffer: &mut message_buffer,
+            inline_search_state: &mut inline_search_state,
+            config: &cfg,
+        };
+        let mut processor = Processor::new(context);
+
+        assert_eq!(processor.cursor_state(), CursorIcon::Pointer);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn tab_bar_click_switches_even_in_mouse_mode() {
+        let mut clipboard = Clipboard::new_nop();
+        let cfg = UiConfig::default();
+        let size = SizeInfo::new(200., 80., 10., 10., 0., 0., false);
+
+        let mut terminal = Term::new(cfg.term_options(), &size, MockEventProxy);
+        let mut mouse = Mouse { x: 50, y: 1, ..Mouse::default() };
+        let mut inline_search_state = InlineSearchState::default();
+        let mut message_buffer = MessageBuffer::default();
+
+        let mut selected_tab: Option<usize> = None;
+
+        struct TabClickContext<'a, T> {
+            terminal: &'a mut Term<T>,
+            size_info: &'a SizeInfo,
+            mouse: &'a mut Mouse,
+            clipboard: &'a mut Clipboard,
+            message_buffer: &'a mut MessageBuffer,
+            modifiers: Modifiers,
+            config: &'a UiConfig,
+            inline_search_state: &'a mut InlineSearchState,
+            selected_tab: &'a mut Option<usize>,
+        }
+
+        impl<T: EventListener> super::ActionContext<T> for TabClickContext<'_, T> {
+            fn search_next(
+                &mut self,
+                _origin: Point,
+                _direction: Direction,
+                _side: Side,
+            ) -> Option<Match> {
+                None
+            }
+
+            fn search_direction(&self) -> Direction {
+                Direction::Right
+            }
+
+            fn inline_search_state(&mut self) -> &mut InlineSearchState {
+                self.inline_search_state
+            }
+
+            fn search_active(&self) -> bool {
+                false
+            }
+
+            fn terminal(&self) -> &Term<T> {
+                self.terminal
+            }
+
+            fn terminal_mut(&mut self) -> &mut Term<T> {
+                self.terminal
+            }
+
+            fn size_info(&self) -> SizeInfo {
+                *self.size_info
+            }
+
+            fn selection_is_empty(&self) -> bool {
+                true
+            }
+
+            fn mouse_mode(&self) -> bool {
+                true
+            }
+
+            fn mouse_mut(&mut self) -> &mut Mouse {
+                self.mouse
+            }
+
+            fn mouse(&self) -> &Mouse {
+                self.mouse
+            }
+
+            fn touch_purpose(&mut self) -> &mut TouchPurpose {
+                unimplemented!();
+            }
+
+            fn modifiers(&mut self) -> &mut Modifiers {
+                &mut self.modifiers
+            }
+
+            fn window(&mut self) -> &mut Window {
+                unimplemented!();
+            }
+
+            fn display(&mut self) -> &mut Display {
+                unimplemented!();
+            }
+
+            fn pop_message(&mut self) {
+                self.message_buffer.pop();
+            }
+
+            fn message(&self) -> Option<&Message> {
+                self.message_buffer.message()
+            }
+
+            fn config(&self) -> &UiConfig {
+                self.config
+            }
+
+            fn clipboard_mut(&mut self) -> &mut Clipboard {
+                self.clipboard
+            }
+
+            #[cfg(target_os = "macos")]
+            fn event_loop(&self) -> &ActiveEventLoop {
+                unimplemented!();
+            }
+
+            fn scheduler_mut(&mut self) -> &mut Scheduler {
+                unimplemented!();
+            }
+
+            fn semantic_word(&self, _point: Point) -> String {
+                unimplemented!();
+            }
+
+            fn tab_bar_hit_test(&self, _x: usize, _y: usize) -> Option<usize> {
+                Some(2)
+            }
+
+            fn select_internal_tab(&mut self, index: usize) {
+                *self.selected_tab = Some(index);
+            }
+        }
+
+        let context = TabClickContext {
+            terminal: &mut terminal,
+            mouse: &mut mouse,
+            size_info: &size,
+            clipboard: &mut clipboard,
+            modifiers: Default::default(),
+            message_buffer: &mut message_buffer,
+            inline_search_state: &mut inline_search_state,
+            config: &cfg,
+            selected_tab: &mut selected_tab,
+        };
+        let mut processor = Processor::new(context);
+
+        processor.mouse_input(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(selected_tab, Some(2));
     }
 
     test_clickstate! {

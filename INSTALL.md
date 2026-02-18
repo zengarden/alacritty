@@ -273,6 +273,20 @@ make app
 cp -r target/release/osx/Alacritty.app /Applications/
 ```
 
+To enable compact tabs on macOS, add the following to your
+`alacritty.toml`:
+
+```toml
+[window.tabs]
+mode = "Compact"
+
+[window.tabs.compact]
+# Optional, in points; null keeps runtime native traffic-light geometry.
+left_inset = 72.0
+# Additional vertical title offset in points.
+label_offset_y = 0.0
+```
+
 #### Universal Binary
 
 The following will build an executable that runs on both x86 and ARM macos
