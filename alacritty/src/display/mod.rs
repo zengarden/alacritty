@@ -777,7 +777,7 @@ impl Display {
         let top_lines = self.compact_tab_lines(config, &size_info);
         if top_lines != 0 {
             let top_inset = self.compact_tab_top_inset(config, &size_info);
-            size_info.padding_y += top_inset;
+            size_info.padding_y = compact_top_padding_y(&size_info, top_inset);
             size_info.height += top_inset;
         }
 
@@ -2090,5 +2090,35 @@ fn effective_window_padding(config: &UiConfig, scale_factor: f32) -> (f32, f32) 
         (padding.0, 0.)
     } else {
         padding
+    }
+}
+
+/// Top padding used for compact-mode hit-testing.
+///
+/// In compact mode the render viewport is reduced by full cell lines, which pushes any leftover
+/// pixel remainder to the top side. Input hit-testing must include that remainder to stay aligned
+/// with rendered rows.
+#[inline]
+fn compact_top_padding_y(size_info: &SizeInfo, top_inset: f32) -> f32 {
+    let viewport_height = (size_info.height - 2. * size_info.padding_y) as usize;
+    let cell_height = size_info.cell_height as usize;
+    let viewport_remainder = (viewport_height % cell_height) as f32;
+    size_info.padding_y + top_inset + viewport_remainder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SizeInfo, compact_top_padding_y};
+
+    #[test]
+    fn compact_top_padding_includes_viewport_remainder() {
+        let size_info = SizeInfo::new(200., 103., 10., 10., 0., 0., false);
+        assert_eq!(compact_top_padding_y(&size_info, 10.), 13.);
+    }
+
+    #[test]
+    fn compact_top_padding_without_remainder_is_stable() {
+        let size_info = SizeInfo::new(200., 100., 10., 10., 0., 0., false);
+        assert_eq!(compact_top_padding_y(&size_info, 10.), 10.);
     }
 }

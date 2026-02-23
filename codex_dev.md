@@ -394,6 +394,24 @@ in Alacritty while keeping the default behavior stable.
     - Added regression test `tab_bar_click_switches_even_in_mouse_mode`.
   - Validation:
     - `cargo test -p alacritty` (90 tests passed)
+- 2026-02-23: Bugfix (compact mode text selection row offset).
+  - Symptom: mouse text selection could land one row below the visual target
+    in compact-tab mode (especially when viewport height had non-cell remainder
+    pixels).
+  - Root cause: compact-mode input hit-testing used `terminal_size_info` with
+    top inset, but did not include the viewport remainder pixels redistributed
+    to the top by viewport/cell quantization; this caused Y-to-row mapping
+    drift.
+  - Fix:
+    - Added `compact_top_padding_y(...)` helper in `display/mod.rs` and updated
+      `Display::terminal_size_info` to include
+      `top_inset + viewport_remainder` in compact-mode top padding.
+    - Added regression tests:
+      `compact_top_padding_includes_viewport_remainder` and
+      `compact_top_padding_without_remainder_is_stable`.
+  - Validation:
+    - `cargo test -p alacritty compact_top_padding -- --nocapture`
+    - `cargo test -p alacritty input::tests::cursor_state_clamps_point_for_stale_terminal_dimensions -- --nocapture`
 
 ## Guardrails
 
@@ -504,3 +522,90 @@ Verification:
 
 Verification:
 - Interaction consistency with no significant performance regressions.
+
+## Context Snapshot (2026-02-18)
+
+This section is a compact archive of "what exists" and the major pitfalls, to
+help resume work quickly after rebases/rollbacks.
+
+### What Was Implemented
+
+- macOS tabs modes:
+  - `window.tabs.mode = "Native"`: keep platform-native macOS tabs.
+  - `window.tabs.mode = "Compact"`: internal tabs with an in-window compact tab bar.
+  - Docs: `extra/man/alacritty.5.scd` and PR-9 doc updates (`README.md`,
+    `docs/features.md`, `INSTALL.md`).
+
+- Internal tab model:
+  - `alacritty/src/tabs/mod.rs`: `TabId`, `TabTitle`, `TabContext`, `TabManager`.
+  - Per-tab state includes terminal, notifier, search state, message buffer, and title state.
+
+- Event/timer isolation by tab:
+  - `alacritty/src/event.rs`: `Event` now carries optional `tab_id`.
+  - `alacritty/src/scheduler.rs`: `TimerId` keys by `(topic, window_id, tab_id)`;
+    tab close uses `Scheduler::unschedule_tab`.
+
+- Compact tab rendering + behavior:
+  - `alacritty/src/display/mod.rs`: draws compact tab bar (top) and reserves
+    top-space in compact mode; stable slot-based widths to avoid visual jitter.
+  - Mouse hit-testing: `Display::compact_tab_at_position`.
+  - Click switching: input hit-tests compact tab bar and switches active tab.
+
+- Tab titles:
+  - Title priority: OSC title > fallback (cwd basename/"Shell").
+  - Duplicate disambiguation: `foo (1)`, `foo (2)` in compact labels.
+  - Active title sync: draw-time fallback sync reads `Term::title()` for robustness.
+
+- macOS compact titlebar integration:
+  - When compact mode is enabled with `window.decorations = "Full"`, startup
+    forces transparent titlebar attributes for a compact look.
+  - Runtime reads native traffic-light geometry (reserved width + center Y) and
+    uses it for compact label alignment/left inset.
+  - Fine-tuning config:
+    - `window.tabs.compact.left_inset` (points, optional override),
+    - `window.tabs.compact.label_offset_y` (points).
+
+### Known Pitfalls / "Gotchas"
+
+- Display geometry vs terminal grid can desync (multi-tab + resize/font changes):
+  - Symptom: intermittent `index out of bounds` panics in any `grid()[point]` path.
+  - Fixes applied:
+    - `Display::handle_update` forces PTY+terminal resize when terminal dimensions
+      are stale vs computed `new_size`.
+    - Clamp mouse-derived points before direct grid indexing in hint/cursor-state paths.
+  - Regression tests added for hint lookup clamping and cursor-state clamping.
+
+- UI clicks must bypass terminal mouse-capture ("mouse mode"):
+  - Symptom: clicking compact tab titles stops switching when active tab runs
+    mouse-capture apps (tmux/vim/etc).
+  - Fix: always do tab-bar hit-test before PTY mouse-mode handling in press+release.
+  - Regression test added: `tab_bar_click_switches_even_in_mouse_mode`.
+
+- Geometry mixing mistakes are easy:
+  - Compact mode uses multiple `SizeInfo`s:
+    - input/hit-test `terminal_size_info` (top-shifted),
+    - renderer-facing `terminal_render_size_info` (bottom-anchored).
+  - Always ensure `renderer.resize(&size_info)` is called for the coordinate
+    space you render text into; "changing padding only" without updating
+    projection causes titles to appear stuck to the top.
+
+### Where To Look First (File Index)
+
+- Compact layout/render/hit-test: `alacritty/src/display/mod.rs`
+- Input routing and UI-vs-mouse-mode behavior: `alacritty/src/input/mod.rs`
+- Window/tab session orchestration: `alacritty/src/window_context.rs`
+- App event routing with `(window_id, tab_id)`: `alacritty/src/event.rs`
+- Scheduler `(topic, window_id, tab_id)`: `alacritty/src/scheduler.rs`
+- macOS titlebar/traffic-light geometry: `alacritty/src/display/window.rs`
+- Config schema: `alacritty/src/config/window.rs` + docs in `extra/man/alacritty.5.scd`
+
+### Fast Verification Checklist
+
+- `cargo test -p alacritty`
+- Manual on macOS with `window.tabs.mode="Compact"`:
+  - `Cmd+T` new tab
+  - `Cmd+1/2/...` switch
+  - click tab titles switches reliably (including tabs running tmux/vim)
+  - `Cmd+W` closes current tab; closing last tab closes window
+  - OSC title updates reflect in tab labels:
+    `printf '\\033]0;my-title\\007'`
