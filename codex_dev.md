@@ -5,6 +5,172 @@ in Alacritty while keeping the default behavior stable.
 
 ## Progress
 
+- 2026-02-24: Compact tab drag/animation redundancy cleanup + hidden-state bugfix.
+  - Reduced redundant animation-side effects:
+    `compact_tab_animation_active` now performs a read-only in-progress check
+    (no state-consuming sampling).
+  - Reduced redundant hit-testing in `mouse_moved` by reusing one tab-hit result
+    for both movability gating and drag preview target updates.
+  - Fixed hidden drag-state stickiness:
+    when window focus is lost or cursor leaves the window, compact tab dragging
+    is cancelled, drag preview is cleared, and macOS window movability is
+    restored.
+  - Style cleanup in compact tab rendering:
+    removed needless `return` and replaced `repeat().take()` with
+    `std::iter::repeat_n(...)`.
+  - Validation:
+    `cargo check -p alacritty`,
+    `cargo test -p alacritty`,
+    `cargo test -p alacritty tab_bar_click_switches_even_in_mouse_mode`,
+    `cargo test -p alacritty tab_bar_drag_release_reorders_tabs`,
+    `cargo test -p alacritty remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab visual cleanup (removed background blocks, restored underline).
+  - Removed all compact active background/card rendering logic from tab bar drawing.
+  - Restored single-cue active style based on underline indicator movement.
+  - Kept compact drag preview + drag reorder path intact, with underline following
+    visual active target during drag.
+  - Removed obsolete animation field (`current_active`) after cleanup.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab text/card layering correction (visual bugfix).
+  - Fixed title vertical alignment regression:
+    compact label row now stays visually centered in compact titlebar geometry.
+  - Fixed double-block artifact:
+    active card is constrained to the label row height (no extra lower block),
+    and optional gloss layer removed.
+  - Removed unused `traffic_lights_center_y` helper after alignment strategy update.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Sliding focus card alignment fix.
+  - Issue: card looked like it was rendered below the tab title row.
+  - Root cause: card geometry used full tab-bar vertical band, while label
+    rendering used a dedicated centered row and could overpaint the card area.
+  - Fix:
+    - card geometry now anchors to the label row (`tab_size_info.padding_y`);
+    - label cell background now blends toward active-card color with active
+      weight, so active area remains visually coherent behind text.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab style upgrade to "sliding focus card".
+  - Replaced per-tab active background tinting with an independent active card layer.
+  - Active card now slides between tab slots during transitions (position/width interpolation).
+  - Tab text backgrounds are now flat (bar background only), reducing noisy flashing and
+    making movement cue come primarily from card geometry.
+  - Added subtle top gloss on the active card for clearer depth and readability.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab visual simplification (single active cue).
+  - Removed bottom active indicator line from compact tab bar.
+  - Kept active-state communication through one cue only:
+    animated active background + foreground contrast transition.
+  - Increased active background blend strength slightly to preserve readability
+    after removing the underline cue.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab drag visual-follow fix.
+  - Problem: drag preview still looked static because active transition easing
+    could be restarted by high-frequency drag target updates, suppressing
+    visible movement.
+  - Fix:
+    - when drag preview target exists, render uses direct visual-active follow
+      (no transition easing reset);
+    - compact drag target updates now pin visual active index immediately and
+      clear transition state during drag preview.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab drag-preview animation fix.
+  - Problem: during drag, tab bar visuals appeared static because preview state
+    was not updated/rendered in real time.
+  - Fixes:
+    - added compact drag-preview target state in `Display`;
+    - mouse drag now updates preview target continuously (`CursorMoved`);
+    - compact tab rendering now uses preview target as visual active slot, so
+      background/indicator visibly move while dragging;
+    - added compact-tab mouse-event immediate processing path to avoid delayed
+      preview updates under event batching.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab interaction latency + animation visibility fix.
+  - Root cause for weak animation visibility:
+    active-highlight background was drawn first, then overwritten by full-cell
+    tab label backgrounds, making transition difficult to perceive.
+  - Fix:
+    - switched to per-tab background interpolation during label rendering
+      (background now participates in active/inactive transition directly);
+    - kept sliding indicator animation and stronger indicator thickness.
+  - Root cause for delayed press behavior:
+    input events were batched and processed later, so tab press could be
+    delayed until a later processing point.
+  - Fix:
+    - added compact-tab-specific immediate event processing path in
+      `WindowContext::handle_event` for tab-related mouse input/drag events.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab interaction + animation enhancement (follow-up).
+  - Interaction update:
+    - left mouse press on compact tab now selects target tab immediately;
+    - drag source is the pressed tab after immediate activation;
+    - mouse release only handles reorder (no delayed select on release).
+  - Animation visibility enhancement:
+    - increased transition duration from `160ms` to `280ms`;
+    - added animated active-tab background highlight (moving translucent block);
+    - increased active indicator line thickness for stronger visual feedback.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab lightweight animation v1 completed.
+  - Added lightweight transition animation for compact tabs:
+    - active indicator line now slides between tabs using time-based interpolation;
+    - tab label foreground now fades between inactive/active colors.
+  - Animation model:
+    - no drag-follow animation, only post-state-change transition;
+    - fixed duration (`160ms`) with smoothstep easing;
+    - keeps existing compact layout/hit-testing logic unchanged.
+  - Added animation state to `Display`:
+    - `compact_tab_active_index` (last observed active index),
+    - `compact_tab_animation` (from/to index + start time).
+  - Added frame-driving integration:
+    - compact tab animation can request follow-up redraws while active,
+      coordinated with existing frame scheduling.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
+- 2026-02-24: Compact tab drag behavior fix (macOS, lightweight v1.1).
+  - Problem: pressing/dragging compact tab titles could still drag the whole
+    terminal window instead of staying in tab-reorder interaction.
+  - Added runtime window-movability control:
+    - `Window::set_movable(bool)` in `alacritty/src/display/window.rs`.
+    - Input trait hook `set_window_movable` to keep tests decoupled from real
+      `Window` objects.
+  - Updated compact-tab mouse flow:
+    - `mouse_moved`: while hovering compact tabs (or while tab drag is active),
+      temporarily disable window dragging.
+    - `on_mouse_press` on compact tab: lock window movement (`movable=false`)
+      and start tab drag source capture.
+    - `on_mouse_release` (left): always restore `movable=true` before applying
+      reorder/select logic.
+  - Validation: `cargo check -p alacritty` and focused compact-tab tests passed:
+    `tab_bar_click_switches_even_in_mouse_mode`,
+    `tab_bar_drag_release_reorders_tabs`,
+    `remap_index_after_move_handles_source_target_and_shift`.
 - 2026-02-17: PR-0 completed.
   - Added `window.tabs.mode` (`Native|Compact`, default `Native`).
   - Added parser tests for tabs mode.

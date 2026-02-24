@@ -220,6 +220,31 @@ impl TabManager {
         let active_id = self.active_id();
         self.remove(active_id).expect("active tab must exist")
     }
+
+    pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tabs.len() || to >= self.tabs.len() || from == to {
+            return false;
+        }
+
+        let active_tab = remap_index_after_move(self.active_tab, from, to);
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = active_tab;
+
+        true
+    }
+}
+
+fn remap_index_after_move(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to {
+        if index > from && index <= to { index - 1 } else { index }
+    } else if index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +294,14 @@ mod tests {
         assert!(title.set_osc(String::from("htop")));
         assert!(title.reset_osc());
         assert!(!title.reset_osc());
+    }
+
+    #[test]
+    fn remap_index_after_move_handles_source_target_and_shift() {
+        assert_eq!(remap_index_after_move(2, 2, 4), 4);
+        assert_eq!(remap_index_after_move(3, 2, 4), 2);
+        assert_eq!(remap_index_after_move(4, 2, 4), 3);
+        assert_eq!(remap_index_after_move(1, 4, 1), 2);
+        assert_eq!(remap_index_after_move(4, 4, 1), 1);
     }
 }

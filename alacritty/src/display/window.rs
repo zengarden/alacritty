@@ -137,7 +137,7 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
-    fn traffic_lights_geometry(&self) -> Option<(f32, f32)> {
+    fn traffic_lights_reserved_width_raw(&self) -> Option<f32> {
         // Match native spacing between traffic lights and title text.
         const TRAFFIC_LIGHTS_TEXT_GAP_POINTS: f64 = 12.;
 
@@ -158,12 +158,9 @@ impl Window {
 
         let right = (close_rect.origin.x + close_rect.size.width)
             .max(zoom_rect.origin.x + zoom_rect.size.width);
-        let center_y = close_rect.origin.y + close_rect.size.height * 0.5;
 
         let scale = self.scale_factor as f32;
-        let reserved_width_px = (right + TRAFFIC_LIGHTS_TEXT_GAP_POINTS).max(0.) as f32 * scale;
-        let center_y_px = center_y.max(0.) as f32 * scale;
-        Some((reserved_width_px, center_y_px))
+        Some((right + TRAFFIC_LIGHTS_TEXT_GAP_POINTS).max(0.) as f32 * scale)
     }
 
     /// Create a new window.
@@ -397,10 +394,12 @@ impl Window {
         match decorations {
             Decorations::Full => window,
             Decorations::Transparent => window
+                .with_movable_by_window_background(false)
                 .with_title_hidden(true)
                 .with_titlebar_transparent(true)
                 .with_fullsize_content_view(true),
             Decorations::Buttonless => window
+                .with_movable_by_window_background(false)
                 .with_title_hidden(true)
                 .with_titlebar_buttons_hidden(true)
                 .with_titlebar_transparent(true)
@@ -532,6 +531,21 @@ impl Window {
         window.setHasShadow(has_shadows);
     }
 
+    /// Enable/disable moving the macOS window through titlebar dragging.
+    ///
+    /// Compact tabs use the titlebar region for interactions, so we temporarily disable this
+    /// while dragging tabs to prevent the whole window from moving.
+    #[cfg(target_os = "macos")]
+    pub fn set_movable(&self, movable: bool) {
+        let Some(view) = self.appkit_view() else {
+            return;
+        };
+        let Some(window) = view.window() else {
+            return;
+        };
+        window.setMovable(movable);
+    }
+
     /// macOS titlebar height in physical pixels.
     ///
     /// This uses `contentLayoutRect` to follow native titlebar geometry instead of relying on
@@ -553,13 +567,7 @@ impl Window {
     /// Horizontal reservation for macOS traffic lights in physical pixels.
     #[cfg(target_os = "macos")]
     pub fn traffic_lights_reserved_width(&self) -> Option<f32> {
-        self.traffic_lights_geometry().map(|(reserved_width, _)| reserved_width)
-    }
-
-    /// Vertical center of macOS traffic lights from the titlebar's top in physical pixels.
-    #[cfg(target_os = "macos")]
-    pub fn traffic_lights_center_y(&self) -> Option<f32> {
-        self.traffic_lights_geometry().map(|(_, center_y)| center_y)
+        self.traffic_lights_reserved_width_raw()
     }
 
     /// Select tab at the given `index`.

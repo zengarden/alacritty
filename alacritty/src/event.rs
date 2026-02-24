@@ -470,6 +470,12 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             #[cfg(target_os = "macos")]
+            (EventType::MoveInternalTab { from, to }, Some(window_id), _) => {
+                if let Some(window_context) = self.windows.get_mut(window_id) {
+                    window_context.move_tab(from, to);
+                }
+            },
+            #[cfg(target_os = "macos")]
             (EventType::SelectLastInternalTab, Some(window_id), _) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.select_last_tab();
@@ -656,6 +662,10 @@ pub enum EventType {
     SelectNextInternalTab,
     SelectPreviousInternalTab,
     SelectInternalTab(usize),
+    MoveInternalTab {
+        from: usize,
+        to: usize,
+    },
     SelectLastInternalTab,
     #[cfg(unix)]
     IpcConfig(IpcConfig),
@@ -1045,6 +1055,32 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
+    fn set_window_movable(&mut self, movable: bool) {
+        self.window().set_movable(movable);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_internal_tab_drag_target(&mut self, index: Option<usize>) {
+        if self.display.set_compact_tab_drag_target(index) {
+            let columns = self.display.size_info.columns();
+            if columns > 0 {
+                let damage = alacritty_terminal::term::LineDamageBounds::new(
+                    0,
+                    0,
+                    columns.saturating_sub(1),
+                );
+                self.display.damage_tracker.frame().damage_line(damage);
+                self.display.damage_tracker.next_frame().damage_line(damage);
+            }
+            *self.dirty = true;
+
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn select_next_internal_tab(&mut self) {
         let window_id = self.display.window.id();
         let event = Event::new(EventType::SelectNextInternalTab, window_id);
@@ -1062,6 +1098,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn select_internal_tab(&mut self, index: usize) {
         let window_id = self.display.window.id();
         let event = Event::new(EventType::SelectInternalTab(index), window_id);
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn move_internal_tab(&mut self, from: usize, to: usize) {
+        let window_id = self.display.window.id();
+        let event = Event::new(EventType::MoveInternalTab { from, to }, window_id);
         let _ = self.event_proxy.send_event(event);
     }
 
@@ -1964,6 +2007,7 @@ pub struct Mouse {
     pub block_hint_launcher: bool,
     pub hint_highlight_dirty: bool,
     pub inside_text_area: bool,
+    pub tab_drag_source: Option<usize>,
     pub x: usize,
     pub y: usize,
 }
@@ -1981,6 +2025,7 @@ impl Default for Mouse {
             hint_highlight_dirty: Default::default(),
             block_hint_launcher: Default::default(),
             inside_text_area: Default::default(),
+            tab_drag_source: Default::default(),
             accumulated_scroll: Default::default(),
             x: Default::default(),
             y: Default::default(),
@@ -2131,6 +2176,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::SelectNextInternalTab
                 | EventType::SelectPreviousInternalTab
                 | EventType::SelectInternalTab(_)
+                | EventType::MoveInternalTab { .. }
                 | EventType::SelectLastInternalTab
                 | EventType::Frame => (),
             },
@@ -2197,6 +2243,15 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 
                         // Ensure IME is disabled while unfocused.
                         self.ctx.window().set_ime_inhibitor(ImeInhibitor::FOCUS, !is_focused);
+
+                        #[cfg(target_os = "macos")]
+                        if !is_focused {
+                            // Cancel in-flight compact-tab drag to avoid sticky drag state after
+                            // app/window focus transitions.
+                            self.ctx.mouse.tab_drag_source = None;
+                            self.ctx.set_internal_tab_drag_target(None);
+                            self.ctx.set_window_movable(true);
+                        }
                     },
                     WindowEvent::Occluded(occluded) => {
                         *self.ctx.occluded = occluded;
@@ -2207,6 +2262,15 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
+
+                        #[cfg(target_os = "macos")]
+                        {
+                            // Leaving the window cancels compact-tab dragging.
+                            if self.ctx.mouse.tab_drag_source.take().is_some() {
+                                self.ctx.set_internal_tab_drag_target(None);
+                            }
+                            self.ctx.set_window_movable(true);
+                        }
 
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;

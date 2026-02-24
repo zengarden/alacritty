@@ -84,6 +84,9 @@ const COMPACT_TAB_SIDE_PADDING: usize = 1;
 /// Spacing between compact tabs.
 const COMPACT_TAB_GAP_COLUMNS: usize = 1;
 
+/// Duration for compact tab active-state transition animation.
+const COMPACT_TAB_ANIMATION_DURATION: Duration = Duration::from_millis(280);
+
 /// Reserved left area for macOS traffic-light buttons in compact mode.
 #[cfg(target_os = "macos")]
 const MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK: f32 = 86.;
@@ -385,6 +388,13 @@ impl CompactTabLayout {
     }
 }
 
+/// Active tab transition state for compact tab animation.
+#[derive(Copy, Clone, Debug)]
+struct CompactTabAnimation {
+    previous_active: usize,
+    started_at: Instant,
+}
+
 /// The display wraps a window, font rasterizer, and GPU renderer.
 pub struct Display {
     pub window: Window,
@@ -431,6 +441,10 @@ pub struct Display {
 
     /// Font size used by the window.
     pub font_size: FontSize,
+
+    compact_tab_active_index: Option<usize>,
+    compact_tab_animation: Option<CompactTabAnimation>,
+    compact_tab_drag_target: Option<usize>,
 
     // Mouse point position when highlighting hints.
     hint_mouse_point: Option<Point>,
@@ -588,6 +602,9 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
+            compact_tab_active_index: Default::default(),
+            compact_tab_animation: Default::default(),
+            compact_tab_drag_target: Default::default(),
         })
     }
 
@@ -677,12 +694,6 @@ impl Display {
             if matches!(config.window.tabs.mode, TabsMode::Compact)
                 && !matches!(config.window.decorations, Decorations::None)
             {
-                if let Some(buttons_center_y) = self.window.traffic_lights_center_y() {
-                    let centered_row_top = buttons_center_y - size_info.cell_height() * 0.5;
-                    let max_row_top = (bar_height - size_info.cell_height()).max(0.);
-                    row_top = centered_row_top.clamp(0., max_row_top);
-                }
-
                 let label_offset_px =
                     config.window.tabs.compact.label_offset_y * self.window.scale_factor as f32;
                 row_top += MACOS_COMPACT_LABEL_BASELINE_SHIFT + label_offset_px;
@@ -714,7 +725,7 @@ impl Display {
                 .or_else(|| self.window.traffic_lights_reserved_width())
                 .unwrap_or(MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK);
             let reserve = (reserve_width / size_info.cell_width()).ceil();
-            return reserve as usize;
+            reserve as usize
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -760,15 +771,74 @@ impl Display {
             }
 
             let wide_slots = tabs_columns % visible_tabs;
-            return Some(CompactTabLayout {
-                start_column,
-                visible_tabs,
-                slot_width,
-                wide_slots,
-            });
+            return Some(CompactTabLayout { start_column, visible_tabs, slot_width, wide_slots });
         }
 
         None
+    }
+
+    #[inline]
+    fn update_compact_tab_animation(&mut self, active_index: Option<usize>) {
+        if self.compact_tab_active_index == active_index {
+            return;
+        }
+
+        self.compact_tab_animation = match (self.compact_tab_active_index, active_index) {
+            (Some(previous_active), Some(current_active)) if previous_active != current_active => {
+                Some(CompactTabAnimation { previous_active, started_at: Instant::now() })
+            },
+            _ => None,
+        };
+
+        self.compact_tab_active_index = active_index;
+    }
+
+    #[inline]
+    pub fn set_compact_tab_drag_target(&mut self, target: Option<usize>) -> bool {
+        if self.compact_tab_drag_target == target {
+            return false;
+        }
+
+        self.compact_tab_drag_target = target;
+        if let Some(target) = target {
+            // Drag preview should be immediate and stable under high-frequency mouse move events.
+            self.compact_tab_animation = None;
+            self.compact_tab_active_index = Some(target);
+        }
+        true
+    }
+
+    #[inline]
+    fn compact_tab_animation_sample(&mut self) -> Option<(CompactTabAnimation, f32)> {
+        let animation = self.compact_tab_animation?;
+        if COMPACT_TAB_ANIMATION_DURATION.is_zero() {
+            self.compact_tab_animation = None;
+            return None;
+        }
+
+        let elapsed = Instant::now().saturating_duration_since(animation.started_at);
+        if elapsed >= COMPACT_TAB_ANIMATION_DURATION {
+            self.compact_tab_animation = None;
+            return None;
+        }
+
+        let progress = elapsed.as_secs_f32() / COMPACT_TAB_ANIMATION_DURATION.as_secs_f32();
+        // Smoothstep easing to keep transitions subtle and lightweight.
+        let eased = progress * progress * (3. - 2. * progress);
+        Some((animation, eased.clamp(0., 1.)))
+    }
+
+    #[inline]
+    pub fn compact_tab_animation_active(&self) -> bool {
+        let Some(animation) = self.compact_tab_animation else {
+            return false;
+        };
+        if COMPACT_TAB_ANIMATION_DURATION.is_zero() {
+            return false;
+        }
+
+        Instant::now().saturating_duration_since(animation.started_at)
+            < COMPACT_TAB_ANIMATION_DURATION
     }
 
     #[inline]
@@ -1103,12 +1173,26 @@ impl Display {
         let total_lines = terminal.grid().total_lines();
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
-        let message_lines = message_buffer.message().map_or(0, |message| message.text(&size_info).len());
+        let message_lines =
+            message_buffer.message().map_or(0, |message| message.text(&size_info).len());
         let search_lines = usize::from(search_state.history_index.is_some());
         let bottom_reserved_lines = message_lines + search_lines;
         let terminal_size_info =
             self.terminal_render_size_info(config, terminal_screen_lines, bottom_reserved_lines);
         let top_bar_lines = self.compact_tab_lines(config, &size_info);
+        if top_bar_lines != 0 {
+            let active_index = tab_bar_entries.iter().position(|tab| tab.is_active);
+            let visual_active_index = self.compact_tab_drag_target.or(active_index);
+            if self.compact_tab_drag_target.is_some() {
+                self.compact_tab_active_index = visual_active_index;
+                self.compact_tab_animation = None;
+            } else {
+                self.update_compact_tab_animation(visual_active_index);
+            }
+        } else {
+            self.compact_tab_drag_target = None;
+            self.update_compact_tab_animation(None);
+        }
 
         let vi_mode = terminal.mode().contains(TermMode::VI);
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
@@ -1455,9 +1539,8 @@ impl Display {
 
         // Find highlighted hint at mouse position.
         let size_info = self.terminal_size_info(config);
-        let point = mouse
-            .point(&size_info, term.grid().display_offset())
-            .grid_clamp(term, Boundary::Grid);
+        let point =
+            mouse.point(&size_info, term.grid().display_offset()).grid_clamp(term, Boundary::Grid);
         let highlighted_hint = hint::highlighted_at(term, config, point, modifiers);
 
         // Update cursor shape.
@@ -1745,14 +1828,61 @@ impl Display {
         tab_size_info.padding_y = self.compact_tab_label_padding_y(config, size_info);
         self.renderer.resize(&tab_size_info);
 
-        let mut column = layout.start_column;
-        let mut active_label_bounds: Option<(usize, usize)> = None;
+        let animation = self.compact_tab_animation_sample();
+        if animation.is_some() && self.window.has_frame {
+            self.window.request_redraw();
+        }
 
         let bar_bg = Self::compact_tab_bar_background(config);
         let active_fg = Self::compact_tab_active_foreground(config);
         let inactive_fg = Self::compact_tab_inactive_foreground(config);
         let inactive_bg = bar_bg;
+        let visual_active_index =
+            self.compact_tab_active_index.filter(|&index| index < layout.visible_tabs);
 
+        let slot_bounds = |target: usize| -> Option<(usize, usize)> {
+            if target >= layout.visible_tabs {
+                return None;
+            }
+
+            let mut column = layout.start_column;
+            for index in 0..layout.visible_tabs {
+                if index > 0 {
+                    column += COMPACT_TAB_GAP_COLUMNS;
+                }
+
+                let slot_width = layout.slot_width_at(index);
+                if index == target {
+                    return Some((column, slot_width));
+                }
+
+                column += slot_width;
+            }
+
+            None
+        };
+
+        let indicator_bounds = match (animation, visual_active_index) {
+            (Some((state, progress)), Some(current_active))
+                if state.previous_active != current_active
+                    && state.previous_active < layout.visible_tabs =>
+            {
+                match (slot_bounds(state.previous_active), slot_bounds(current_active)) {
+                    (Some((from_column, from_width)), Some((to_column, to_width))) => Some((
+                        from_column as f32 + (to_column as f32 - from_column as f32) * progress,
+                        from_width as f32 + (to_width as f32 - from_width as f32) * progress,
+                    )),
+                    _ => slot_bounds(current_active)
+                        .map(|(column, width)| (column as f32, width as f32)),
+                }
+            },
+            (_, Some(active)) => {
+                slot_bounds(active).map(|(column, width)| (column as f32, width as f32))
+            },
+            _ => None,
+        };
+
+        let mut column = layout.start_column;
         for (index, tab) in tabs.iter().take(layout.visible_tabs).enumerate() {
             if index > 0 {
                 let point = Point::new(0, Column(column));
@@ -1783,35 +1913,28 @@ impl Display {
             let left_extra_padding = centered_padding / 2;
             let right_extra_padding = centered_padding - left_extra_padding;
             let mut label = String::with_capacity(slot_width);
-            label.extend(std::iter::repeat(' ').take(COMPACT_TAB_SIDE_PADDING + left_extra_padding));
+            label.extend(std::iter::repeat_n(' ', COMPACT_TAB_SIDE_PADDING + left_extra_padding));
             label.push_str(&title);
-            label.extend(
-                std::iter::repeat(' ')
-                    .take(COMPACT_TAB_SIDE_PADDING + right_extra_padding),
-            );
+            label.extend(std::iter::repeat_n(' ', COMPACT_TAB_SIDE_PADDING + right_extra_padding));
 
             let point = Point::new(0, Column(column));
-            let (fg, bg) =
-                if tab.is_active { (active_fg, bar_bg) } else { (inactive_fg, inactive_bg) };
+            let fg = if Some(index) == visual_active_index { active_fg } else { inactive_fg };
             self.renderer.draw_string(
                 point,
                 fg,
-                bg,
+                inactive_bg,
                 label.chars(),
                 &tab_size_info,
                 &mut self.glyph_cache,
             );
-            if tab.is_active {
-                active_label_bounds = Some((column, slot_width));
-            }
             column += slot_width;
         }
 
-        if let Some((start_column, len_columns)) = active_label_bounds {
+        if let Some((start_column, len_columns)) = indicator_bounds {
             let cell_width = size_info.cell_width();
-            let x = size_info.padding_x() + (start_column as f32 * cell_width);
-            let width = len_columns as f32 * cell_width;
-            let indicator_height = (size_info.cell_height() * 0.14).max(2.);
+            let x = size_info.padding_x() + start_column * cell_width;
+            let width = len_columns * cell_width;
+            let indicator_height = (size_info.cell_height() * 0.2).max(3.);
             let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
             let y = (bar_bottom - indicator_height).max(size_info.padding_y());
             let indicator = RenderRect::new(x, y, width, indicator_height, active_fg, 1.);
@@ -2108,7 +2231,7 @@ fn compact_top_padding_y(size_info: &SizeInfo, top_inset: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SizeInfo, compact_top_padding_y};
+    use super::{compact_top_padding_y, SizeInfo};
 
     #[test]
     fn compact_top_padding_includes_viewport_remainder() {

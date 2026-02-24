@@ -6,7 +6,7 @@
 //! determine what to do when a non-modifier key is pressed.
 
 use std::borrow::Cow;
-use std::cmp::{Ordering, max, min};
+use std::cmp::{max, min, Ordering};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -115,9 +115,15 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn select_internal_tab(&mut self, _index: usize) {}
     #[cfg(target_os = "macos")]
+    fn move_internal_tab(&mut self, _from: usize, _to: usize) {}
+    #[cfg(target_os = "macos")]
     fn select_last_internal_tab(&mut self) {}
     #[cfg(target_os = "macos")]
     fn close_internal_tab(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn set_window_movable(&mut self, _movable: bool) {}
+    #[cfg(target_os = "macos")]
+    fn set_internal_tab_drag_target(&mut self, _index: Option<usize>) {}
     fn change_font_size(&mut self, _delta: f32) {}
     fn reset_font_size(&mut self) {}
     fn pop_message(&mut self) {}
@@ -539,6 +545,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
 
+        #[cfg(target_os = "macos")]
+        {
+            let tab_hit = self.ctx.tab_bar_hit_test(x, y);
+            let dragging_tab = lmb_pressed && self.ctx.mouse().tab_drag_source.is_some();
+            self.ctx.set_window_movable(tab_hit.is_none() && !dragging_tab);
+
+            if dragging_tab {
+                let source = self.ctx.mouse().tab_drag_source;
+                self.ctx.set_internal_tab_drag_target(tab_hit.or(source));
+            }
+        }
+
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
 
@@ -565,6 +583,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         // Don't launch URLs if mouse has moved.
         self.ctx.mouse_mut().block_hint_launcher = true;
+
+        // Dragging compact tab titles should not select terminal text.
+        if lmb_pressed && self.ctx.mouse().tab_drag_source.is_some() {
+            return;
+        }
 
         if (lmb_pressed || rmb_pressed)
             && (self.ctx.modifiers().state().shift_key() || !self.ctx.mouse_mode())
@@ -689,11 +712,19 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // PTY mouse protocol.
         #[cfg(target_os = "macos")]
         if let MouseButton::Left = button {
+            self.ctx.mouse_mut().tab_drag_source = None;
+
             let mouse = self.ctx.mouse();
             if let Some(tab_index) = self.ctx.tab_bar_hit_test(mouse.x, mouse.y) {
+                self.ctx.set_window_movable(false);
                 self.ctx.select_internal_tab(tab_index);
+                self.ctx.mouse_mut().tab_drag_source = Some(tab_index);
+                self.ctx.set_internal_tab_drag_target(Some(tab_index));
                 return;
             }
+
+            self.ctx.set_internal_tab_drag_target(None);
+            self.ctx.set_window_movable(true);
         }
 
         // Handle mouse mode.
@@ -778,8 +809,24 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // If the click is on the compact tab bar, don't emit PTY mouse reports on release.
         #[cfg(target_os = "macos")]
         if let MouseButton::Left = button {
-            let mouse = self.ctx.mouse();
-            if self.ctx.tab_bar_hit_test(mouse.x, mouse.y).is_some() {
+            self.ctx.set_window_movable(true);
+
+            let tab_drop_target = {
+                let mouse = self.ctx.mouse();
+                self.ctx.tab_bar_hit_test(mouse.x, mouse.y)
+            };
+            let tab_drag_source = self.ctx.mouse_mut().tab_drag_source.take();
+            self.ctx.set_internal_tab_drag_target(None);
+
+            if let Some(from) = tab_drag_source {
+                let to = tab_drop_target.unwrap_or(from);
+                if from != to {
+                    self.ctx.move_internal_tab(from, to);
+                }
+                return;
+            }
+
+            if tab_drop_target.is_some() {
                 return;
             }
         }
@@ -1486,11 +1533,8 @@ mod tests {
         // Keep cursor-state evaluation in message-bar branch to avoid display mock access.
         let terminal_end = stale_size.padding_y() as usize
             + stale_size.cell_height() as usize * stale_size.screen_lines();
-        let mut mouse = Mouse {
-            x: stale_size.width() as usize - 1,
-            y: terminal_end + 1,
-            ..Mouse::default()
-        };
+        let mut mouse =
+            Mouse { x: stale_size.width() as usize - 1, y: terminal_end + 1, ..Mouse::default() };
 
         let mut inline_search_state = InlineSearchState::default();
         let mut message_buffer = MessageBuffer::default();
@@ -1524,6 +1568,7 @@ mod tests {
         let mut message_buffer = MessageBuffer::default();
 
         let mut selected_tab: Option<usize> = None;
+        let mut moved_tab: Option<(usize, usize)> = None;
 
         struct TabClickContext<'a, T> {
             terminal: &'a mut Term<T>,
@@ -1535,6 +1580,7 @@ mod tests {
             config: &'a UiConfig,
             inline_search_state: &'a mut InlineSearchState,
             selected_tab: &'a mut Option<usize>,
+            moved_tab: &'a mut Option<(usize, usize)>,
         }
 
         impl<T: EventListener> super::ActionContext<T> for TabClickContext<'_, T> {
@@ -1632,12 +1678,16 @@ mod tests {
                 unimplemented!();
             }
 
-            fn tab_bar_hit_test(&self, _x: usize, _y: usize) -> Option<usize> {
-                Some(2)
+            fn tab_bar_hit_test(&self, x: usize, _y: usize) -> Option<usize> {
+                Some(if x < 100 { 2 } else { 1 })
             }
 
             fn select_internal_tab(&mut self, index: usize) {
                 *self.selected_tab = Some(index);
+            }
+
+            fn move_internal_tab(&mut self, from: usize, to: usize) {
+                *self.moved_tab = Some((from, to));
             }
         }
 
@@ -1651,11 +1701,175 @@ mod tests {
             inline_search_state: &mut inline_search_state,
             config: &cfg,
             selected_tab: &mut selected_tab,
+            moved_tab: &mut moved_tab,
         };
         let mut processor = Processor::new(context);
 
         processor.mouse_input(ElementState::Pressed, MouseButton::Left);
-        assert_eq!(selected_tab, Some(2));
+        assert_eq!(*processor.ctx.selected_tab, Some(2));
+        processor.mouse_input(ElementState::Released, MouseButton::Left);
+        assert_eq!(*processor.ctx.selected_tab, Some(2));
+        assert_eq!(*processor.ctx.moved_tab, None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn tab_bar_drag_release_reorders_tabs() {
+        let mut clipboard = Clipboard::new_nop();
+        let cfg = UiConfig::default();
+        let size = SizeInfo::new(200., 80., 10., 10., 0., 0., false);
+
+        let mut terminal = Term::new(cfg.term_options(), &size, MockEventProxy);
+        let mut mouse = Mouse { x: 50, y: 1, ..Mouse::default() };
+        let mut inline_search_state = InlineSearchState::default();
+        let mut message_buffer = MessageBuffer::default();
+
+        let mut selected_tab: Option<usize> = None;
+        let mut moved_tab: Option<(usize, usize)> = None;
+
+        struct TabDragContext<'a, T> {
+            terminal: &'a mut Term<T>,
+            size_info: &'a SizeInfo,
+            mouse: &'a mut Mouse,
+            clipboard: &'a mut Clipboard,
+            message_buffer: &'a mut MessageBuffer,
+            modifiers: Modifiers,
+            config: &'a UiConfig,
+            inline_search_state: &'a mut InlineSearchState,
+            selected_tab: &'a mut Option<usize>,
+            moved_tab: &'a mut Option<(usize, usize)>,
+        }
+
+        impl<T: EventListener> super::ActionContext<T> for TabDragContext<'_, T> {
+            fn search_next(
+                &mut self,
+                _origin: Point,
+                _direction: Direction,
+                _side: Side,
+            ) -> Option<Match> {
+                None
+            }
+
+            fn search_direction(&self) -> Direction {
+                Direction::Right
+            }
+
+            fn inline_search_state(&mut self) -> &mut InlineSearchState {
+                self.inline_search_state
+            }
+
+            fn search_active(&self) -> bool {
+                false
+            }
+
+            fn terminal(&self) -> &Term<T> {
+                self.terminal
+            }
+
+            fn terminal_mut(&mut self) -> &mut Term<T> {
+                self.terminal
+            }
+
+            fn size_info(&self) -> SizeInfo {
+                *self.size_info
+            }
+
+            fn selection_is_empty(&self) -> bool {
+                true
+            }
+
+            fn mouse_mode(&self) -> bool {
+                true
+            }
+
+            fn mouse_mut(&mut self) -> &mut Mouse {
+                self.mouse
+            }
+
+            fn mouse(&self) -> &Mouse {
+                self.mouse
+            }
+
+            fn touch_purpose(&mut self) -> &mut TouchPurpose {
+                unimplemented!();
+            }
+
+            fn modifiers(&mut self) -> &mut Modifiers {
+                &mut self.modifiers
+            }
+
+            fn window(&mut self) -> &mut Window {
+                unimplemented!();
+            }
+
+            fn display(&mut self) -> &mut Display {
+                unimplemented!();
+            }
+
+            fn pop_message(&mut self) {
+                self.message_buffer.pop();
+            }
+
+            fn message(&self) -> Option<&Message> {
+                self.message_buffer.message()
+            }
+
+            fn config(&self) -> &UiConfig {
+                self.config
+            }
+
+            fn clipboard_mut(&mut self) -> &mut Clipboard {
+                self.clipboard
+            }
+
+            #[cfg(target_os = "macos")]
+            fn event_loop(&self) -> &ActiveEventLoop {
+                unimplemented!();
+            }
+
+            fn scheduler_mut(&mut self) -> &mut Scheduler {
+                unimplemented!();
+            }
+
+            fn semantic_word(&self, _point: Point) -> String {
+                unimplemented!();
+            }
+
+            fn tab_bar_hit_test(&self, x: usize, _y: usize) -> Option<usize> {
+                Some(if x < 100 { 2 } else { 1 })
+            }
+
+            fn select_internal_tab(&mut self, index: usize) {
+                *self.selected_tab = Some(index);
+            }
+
+            fn move_internal_tab(&mut self, from: usize, to: usize) {
+                *self.moved_tab = Some((from, to));
+                *self.selected_tab = Some(to);
+            }
+        }
+
+        let context = TabDragContext {
+            terminal: &mut terminal,
+            mouse: &mut mouse,
+            size_info: &size,
+            clipboard: &mut clipboard,
+            modifiers: Default::default(),
+            message_buffer: &mut message_buffer,
+            inline_search_state: &mut inline_search_state,
+            config: &cfg,
+            selected_tab: &mut selected_tab,
+            moved_tab: &mut moved_tab,
+        };
+        let mut processor = Processor::new(context);
+
+        processor.mouse_input(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(*processor.ctx.selected_tab, Some(2));
+        processor.ctx.mouse.x = 150;
+        processor.mouse_input(ElementState::Released, MouseButton::Left);
+
+        assert_eq!(*processor.ctx.selected_tab, Some(1));
+        assert_eq!(*processor.ctx.moved_tab, Some((2, 1)));
     }
 
     test_clickstate! {

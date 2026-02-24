@@ -1,16 +1,16 @@
 //! Terminal window context.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::mem;
-use std::path::Path;
 #[cfg(not(windows))]
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
-use std::collections::HashMap;
 
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
@@ -18,7 +18,7 @@ use glutin::display::GetGlDisplay;
 use glutin::platform::x11::X11GlConfigExt;
 use log::info;
 use serde_json as json;
-use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
+use winit::event::{Event as WinitEvent, Modifiers, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
@@ -34,8 +34,8 @@ use alacritty_terminal::tty;
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
-use crate::config::UiConfig;
 use crate::config::window::TabsMode;
+use crate::config::UiConfig;
 use crate::display::window::Window;
 use crate::display::{Display, TabBarEntry};
 use crate::event::{ActionContext, Event, EventProxy, Mouse, SearchState, TouchPurpose};
@@ -304,7 +304,11 @@ impl WindowContext {
         }
 
         let cwd = working_directory.to_string_lossy();
-        if cwd.is_empty() { String::from("Shell") } else { cwd.into_owned() }
+        if cwd.is_empty() {
+            String::from("Shell")
+        } else {
+            cwd.into_owned()
+        }
     }
 
     fn refresh_window_title(&mut self) {
@@ -317,11 +321,7 @@ impl WindowContext {
         } else if matches!(self.config.window.tabs.mode, TabsMode::Compact) {
             self.active_tab().title.display().to_owned()
         } else {
-            self.active_tab()
-                .title
-                .osc()
-                .unwrap_or(&self.config.window.identity.title)
-                .to_owned()
+            self.active_tab().title.osc().unwrap_or(&self.config.window.identity.title).to_owned()
         };
 
         self.display.window.set_title(title);
@@ -647,6 +647,13 @@ impl WindowContext {
         }
     }
 
+    /// Reorder internal tabs by moving one tab index to another.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if self.tabs.move_tab(from, to) {
+            self.on_tab_collection_change();
+        }
+    }
+
     /// Close the active internal tab.
     pub fn close_active_tab(&mut self, scheduler: &mut Scheduler) {
         if self.tabs.len() <= 1 {
@@ -714,15 +721,8 @@ impl WindowContext {
         self.sync_active_tab_title_from_terminal();
         self.refresh_tab_bar_entries_cache();
 
-        let WindowContext {
-            display,
-            dirty,
-            occluded,
-            tabs,
-            tab_bar_entries_cache,
-            config,
-            ..
-        } = self;
+        let WindowContext { display, dirty, occluded, tabs, tab_bar_entries_cache, config, .. } =
+            self;
         let tab_bar_entries = tab_bar_entries_cache.as_slice();
 
         display.window.requested_redraw = false;
@@ -737,7 +737,8 @@ impl WindowContext {
         display.process_renderer_update();
 
         // Request immediate re-draw if visual bell animation is not finished yet.
-        if !display.visual_bell.completed() {
+        let compact_tab_animation_active = display.compact_tab_animation_active();
+        if !display.visual_bell.completed() || compact_tab_animation_active {
             // We can get an OS redraw which bypasses alacritty's frame throttling, thus
             // marking the window as dirty when we don't have frame yet.
             if display.window.has_frame {
@@ -773,6 +774,7 @@ impl WindowContext {
             return;
         }
 
+        let should_process_immediately = self.should_process_immediately(&event);
         let is_redraw_requested =
             matches!(event, WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. });
 
@@ -788,7 +790,9 @@ impl WindowContext {
             },
             event => {
                 self.event_queue.push(event);
-                return;
+                if !should_process_immediately {
+                    return;
+                }
             },
         }
 
@@ -958,6 +962,38 @@ impl WindowContext {
                 event.tab_id().is_none_or(|event_tab_id| event_tab_id == tab_id)
             },
             _ => true,
+        }
+    }
+
+    /// Decide whether an input event should bypass batching.
+    ///
+    /// Compact-tab interactions need low latency for press-to-select and drag behavior.
+    fn should_process_immediately(&mut self, event: &WinitEvent<Event>) -> bool {
+        if !matches!(self.config.window.tabs.mode, TabsMode::Compact) {
+            return false;
+        }
+
+        match event {
+            WinitEvent::WindowEvent {
+                event: WindowEvent::MouseInput { button: MouseButton::Left, .. },
+                ..
+            } => {
+                self.refresh_tab_bar_entries_cache();
+                let mouse = &self.mouse;
+                self.display
+                    .compact_tab_at_position(
+                        self.config.as_ref(),
+                        self.tab_bar_entries_cache.as_slice(),
+                        mouse.x,
+                        mouse.y,
+                    )
+                    .is_some()
+                    || mouse.tab_drag_source.is_some()
+            },
+            WinitEvent::WindowEvent { event: WindowEvent::CursorMoved { .. }, .. } => {
+                self.mouse.tab_drag_source.is_some()
+            },
+            _ => false,
         }
     }
 }
