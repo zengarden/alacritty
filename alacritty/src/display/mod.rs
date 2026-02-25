@@ -1839,28 +1839,23 @@ impl Display {
         let inactive_bg = bar_bg;
         let visual_active_index =
             self.compact_tab_active_index.filter(|&index| index < layout.visible_tabs);
+        let cell_width = size_info.cell_width();
+        let bar_top = size_info.padding_y();
+        let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
 
-        let slot_bounds = |target: usize| -> Option<(usize, usize)> {
-            if target >= layout.visible_tabs {
-                return None;
+        let mut slots = Vec::with_capacity(layout.visible_tabs);
+        let mut next_column = layout.start_column;
+        for index in 0..layout.visible_tabs {
+            if index > 0 {
+                next_column += COMPACT_TAB_GAP_COLUMNS;
             }
 
-            let mut column = layout.start_column;
-            for index in 0..layout.visible_tabs {
-                if index > 0 {
-                    column += COMPACT_TAB_GAP_COLUMNS;
-                }
+            let slot_width = layout.slot_width_at(index);
+            slots.push((next_column, slot_width));
+            next_column += slot_width;
+        }
 
-                let slot_width = layout.slot_width_at(index);
-                if index == target {
-                    return Some((column, slot_width));
-                }
-
-                column += slot_width;
-            }
-
-            None
-        };
+        let slot_bounds = |target: usize| -> Option<(usize, usize)> { slots.get(target).copied() };
 
         let indicator_bounds = match (animation, visual_active_index) {
             (Some((state, progress)), Some(current_active))
@@ -1882,10 +1877,12 @@ impl Display {
             _ => None,
         };
 
-        let mut column = layout.start_column;
-        for (index, tab) in tabs.iter().take(layout.visible_tabs).enumerate() {
+        for (index, (tab, (start_column, slot_width))) in
+            tabs.iter().take(layout.visible_tabs).zip(slots.iter().copied()).enumerate()
+        {
             if index > 0 {
-                let point = Point::new(0, Column(column));
+                let gap_start = start_column - COMPACT_TAB_GAP_COLUMNS;
+                let point = Point::new(0, Column(gap_start));
                 let gap = " ".repeat(COMPACT_TAB_GAP_COLUMNS);
                 self.renderer.draw_string(
                     point,
@@ -1895,10 +1892,8 @@ impl Display {
                     &tab_size_info,
                     &mut self.glyph_cache,
                 );
-                column += COMPACT_TAB_GAP_COLUMNS;
             }
 
-            let slot_width = layout.slot_width_at(index);
             let inner_width = slot_width.saturating_sub(COMPACT_TAB_SIDE_PADDING * 2);
             let title: String = StrShortener::new(
                 &tab.title,
@@ -1917,7 +1912,7 @@ impl Display {
             label.push_str(&title);
             label.extend(std::iter::repeat_n(' ', COMPACT_TAB_SIDE_PADDING + right_extra_padding));
 
-            let point = Point::new(0, Column(column));
+            let point = Point::new(0, Column(start_column));
             let fg = if Some(index) == visual_active_index { active_fg } else { inactive_fg };
             self.renderer.draw_string(
                 point,
@@ -1927,15 +1922,57 @@ impl Display {
                 &tab_size_info,
                 &mut self.glyph_cache,
             );
-            column += slot_width;
+        }
+
+        let separator_color = Self::mix_rgb(inactive_fg, bar_bg, 0.72);
+        let separator_width = (cell_width * 0.08).max(1.);
+        let separator_margin = (size_info.cell_height() * 0.22).max(2.);
+        let separator_y = bar_top + separator_margin;
+        let separator_height = (bar_bottom - bar_top - separator_margin * 2.).max(1.);
+
+        let inactive_indicator_color = Self::mix_rgb(inactive_fg, bar_bg, 0.45);
+        let inactive_indicator_height = (size_info.cell_height() * 0.08).max(1.);
+        let inactive_indicator_y = (bar_bottom - inactive_indicator_height).max(bar_top);
+
+        let mut decoration_rects = Vec::with_capacity(slots.len().saturating_mul(2));
+        for (index, (start_column, slot_width)) in slots.iter().copied().enumerate() {
+            if Some(index) != visual_active_index {
+                let x = size_info.padding_x() + start_column as f32 * cell_width;
+                let width = slot_width as f32 * cell_width;
+                let indicator = RenderRect::new(
+                    x,
+                    inactive_indicator_y,
+                    width,
+                    inactive_indicator_height,
+                    inactive_indicator_color,
+                    1.,
+                );
+                decoration_rects.push(indicator);
+            }
+
+            if index > 0 {
+                let gap_start = start_column - COMPACT_TAB_GAP_COLUMNS;
+                let gap_center = gap_start as f32 + COMPACT_TAB_GAP_COLUMNS as f32 * 0.5;
+                let x = size_info.padding_x() + gap_center * cell_width - separator_width * 0.5;
+                let separator = RenderRect::new(
+                    x,
+                    separator_y,
+                    separator_width,
+                    separator_height,
+                    separator_color,
+                    1.,
+                );
+                decoration_rects.push(separator);
+            }
+        }
+        if !decoration_rects.is_empty() {
+            self.renderer.draw_rects(size_info, &self.glyph_cache.font_metrics(), decoration_rects);
         }
 
         if let Some((start_column, len_columns)) = indicator_bounds {
-            let cell_width = size_info.cell_width();
             let x = size_info.padding_x() + start_column * cell_width;
             let width = len_columns * cell_width;
             let indicator_height = (size_info.cell_height() * 0.2).max(3.);
-            let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
             let y = (bar_bottom - indicator_height).max(size_info.padding_y());
             let indicator = RenderRect::new(x, y, width, indicator_height, active_fg, 1.);
             self.renderer.draw_rects(size_info, &self.glyph_cache.font_metrics(), vec![indicator]);

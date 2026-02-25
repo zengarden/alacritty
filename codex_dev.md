@@ -5,6 +5,18 @@ in Alacritty while keeping the default behavior stable.
 
 ## Progress
 
+- 2026-02-25: Compact tab non-active clarity enhancement (underline-only style).
+  - Improved distinction for non-active tabs without reintroducing background blocks.
+  - Added subtle vertical separators between compact tabs to make slot boundaries clear.
+  - Added faint bottom baselines for non-active tabs; active tab keeps the strong animated
+    underline indicator.
+  - Refactored `draw_tab_bar` slot geometry to compute tab slot bounds once and reuse them
+    for text layout and indicator/decorator rendering.
+  - Validation:
+    `cargo check -p alacritty`,
+    `cargo test -p alacritty tab_bar_click_switches_even_in_mouse_mode`,
+    `cargo test -p alacritty tab_bar_drag_release_reorders_tabs`,
+    `cargo test -p alacritty remap_index_after_move_handles_source_target_and_shift`.
 - 2026-02-24: Compact tab drag/animation redundancy cleanup + hidden-state bugfix.
   - Reduced redundant animation-side effects:
     `compact_tab_animation_active` now performs a read-only in-progress check
