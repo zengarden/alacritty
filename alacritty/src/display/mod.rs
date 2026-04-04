@@ -391,7 +391,6 @@ impl CompactTabLayout {
 /// Active tab transition state for compact tab animation.
 #[derive(Copy, Clone, Debug)]
 struct CompactTabAnimation {
-    previous_active: usize,
     started_at: Instant,
 }
 
@@ -805,7 +804,7 @@ impl Display {
 
         self.compact_tab_animation = match (self.compact_tab_active_index, active_index) {
             (Some(previous_active), Some(current_active)) if previous_active != current_active => {
-                Some(CompactTabAnimation { previous_active, started_at: Instant::now() })
+                Some(CompactTabAnimation { started_at: Instant::now() })
             },
             _ => None,
         };
@@ -826,26 +825,6 @@ impl Display {
             self.compact_tab_active_index = Some(target);
         }
         true
-    }
-
-    #[inline]
-    fn compact_tab_animation_sample(&mut self) -> Option<(CompactTabAnimation, f32)> {
-        let animation = self.compact_tab_animation?;
-        if COMPACT_TAB_ANIMATION_DURATION.is_zero() {
-            self.compact_tab_animation = None;
-            return None;
-        }
-
-        let elapsed = Instant::now().saturating_duration_since(animation.started_at);
-        if elapsed >= COMPACT_TAB_ANIMATION_DURATION {
-            self.compact_tab_animation = None;
-            return None;
-        }
-
-        let progress = elapsed.as_secs_f32() / COMPACT_TAB_ANIMATION_DURATION.as_secs_f32();
-        // Smoothstep easing to keep transitions subtle and lightweight.
-        let eased = progress * progress * (3. - 2. * progress);
-        Some((animation, eased.clamp(0., 1.)))
     }
 
     #[inline]
@@ -1853,11 +1832,6 @@ impl Display {
         tab_size_info.padding_y = self.compact_tab_label_padding_y(config, size_info);
         self.renderer.resize(&tab_size_info);
 
-        let animation = self.compact_tab_animation_sample();
-        if animation.is_some() && self.window.has_frame {
-            self.window.request_redraw();
-        }
-
         let bar_bg = Self::compact_tab_bar_background(config);
         let active_bg = Self::compact_tab_active_background(config);
         let inactive_bg = Self::compact_tab_inactive_background(config);
@@ -1882,7 +1856,6 @@ impl Display {
         let separator_color = Self::mix_rgb(bar_bg, inactive_fg, 0.14);
         let inactive_border = Self::mix_rgb(inactive_bg, inactive_fg, 0.18);
         let active_border = Self::mix_rgb(active_bg, active_fg, 0.24);
-        let active_glow = Self::mix_rgb(active_bg, active_fg, 0.55);
 
         let mut slots = Vec::with_capacity(layout.visible_tabs);
         let mut next_column = layout.start_column;
@@ -1895,28 +1868,6 @@ impl Display {
             slots.push((next_column, slot_width));
             next_column += slot_width;
         }
-
-        let slot_bounds = |target: usize| -> Option<(usize, usize)> { slots.get(target).copied() };
-
-        let indicator_bounds = match (animation, visual_active_index) {
-            (Some((state, progress)), Some(current_active))
-                if state.previous_active != current_active
-                    && state.previous_active < layout.visible_tabs =>
-            {
-                match (slot_bounds(state.previous_active), slot_bounds(current_active)) {
-                    (Some((from_column, from_width)), Some((to_column, to_width))) => Some((
-                        from_column as f32 + (to_column as f32 - from_column as f32) * progress,
-                        from_width as f32 + (to_width as f32 - from_width as f32) * progress,
-                    )),
-                    _ => slot_bounds(current_active)
-                        .map(|(column, width)| (column as f32, width as f32)),
-                }
-            },
-            (_, Some(active)) => {
-                slot_bounds(active).map(|(column, width)| (column as f32, width as f32))
-            },
-            _ => None,
-        };
 
         for (index, (tab, (start_column, slot_width))) in
             tabs.iter().take(layout.visible_tabs).zip(slots.iter().copied()).enumerate()
@@ -2080,14 +2031,6 @@ impl Display {
 
                 decoration_rects.push(RenderRect::new(
                     x + active_corner_cut_width,
-                    active_frame_top,
-                    horizontal_width,
-                    border_thickness,
-                    border_color,
-                    border_alpha,
-                ));
-                decoration_rects.push(RenderRect::new(
-                    x + active_corner_cut_width,
                     active_frame_bottom - border_thickness,
                     horizontal_width,
                     border_thickness,
@@ -2095,14 +2038,6 @@ impl Display {
                     border_alpha,
                 ));
             } else if is_active {
-                decoration_rects.push(RenderRect::new(
-                    x,
-                    active_frame_top,
-                    width,
-                    border_thickness,
-                    border_color,
-                    border_alpha,
-                ));
                 decoration_rects.push(RenderRect::new(
                     x,
                     active_frame_bottom - border_thickness,
@@ -2113,21 +2048,6 @@ impl Display {
                 ));
             }
 
-        }
-
-        if let Some((start_column, len_columns)) = indicator_bounds {
-            let x = size_info.padding_x() + start_column * cell_width;
-            let width = len_columns * cell_width;
-            let glow_width = (width - active_corner_cut_width * 2.).max(1.);
-            let glow = RenderRect::new(
-                x + active_corner_cut_width,
-                active_frame_top,
-                glow_width,
-                border_thickness,
-                active_glow,
-                0.9,
-            );
-            decoration_rects.push(glow);
         }
 
         if !decoration_rects.is_empty() {
