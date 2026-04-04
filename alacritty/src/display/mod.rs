@@ -46,7 +46,7 @@ use crate::config::window::StartupMode;
 use crate::config::window::{Dimensions, TabsMode};
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
-use crate::display::content::{RenderableContent, RenderableCursor};
+use crate::display::content::{RenderableCell, RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
@@ -622,13 +622,7 @@ impl Display {
     }
 
     #[inline]
-    fn compact_tab_bar_background(config: &UiConfig) -> Rgb {
-        config.colors.primary.background
-    }
-
-    #[inline]
-    fn compact_tab_active_background(config: &UiConfig) -> Rgb {
-        let bar_bg = Self::compact_tab_bar_background(config);
+    fn compact_tab_active_background(config: &UiConfig, bar_bg: Rgb) -> Rgb {
         let active_fg =
             config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground);
         Self::mix_rgb(bar_bg, active_fg, 0.1)
@@ -640,12 +634,8 @@ impl Display {
     }
 
     #[inline]
-    fn compact_tab_inactive_foreground(config: &UiConfig) -> Rgb {
-        Self::mix_rgb(
-            config.colors.primary.foreground,
-            Self::compact_tab_bar_background(config),
-            0.58,
-        )
+    fn compact_tab_inactive_foreground(config: &UiConfig, bar_bg: Rgb) -> Rgb {
+        Self::mix_rgb(config.colors.primary.foreground, bar_bg, 0.58)
     }
 
     #[inline]
@@ -1315,11 +1305,9 @@ impl Display {
             let y = size_info.padding_y();
             let width = size_info.width() as i32;
             let height = self.compact_tab_bar_height(config, &size_info) as i32;
-            let bg = Self::compact_tab_bar_background(config);
+            let bg = background_color;
             let divider_color =
                 Self::mix_rgb(bg, Self::compact_tab_active_foreground(config), 0.16);
-            let tab_bar_rect = RenderRect::new(0., y, width as f32, height as f32, bg, 1.);
-            ui_rects.push(tab_bar_rect);
             let divider_y = (y + height as f32 - 1.).max(y);
             let divider = RenderRect::new(0., divider_y, width as f32, 1., divider_color, 0.4);
             ui_rects.push(divider);
@@ -1388,7 +1376,7 @@ impl Display {
 
         if top_bar_lines != 0 {
             self.renderer.resize(&size_info);
-            self.draw_tab_bar(config, &size_info, tab_bar_entries);
+            self.draw_tab_bar(config, &size_info, tab_bar_entries, background_color);
         }
 
         self.renderer.resize(&terminal_size_info);
@@ -1751,9 +1739,52 @@ impl Display {
         }
     }
 
+    #[inline]
+    fn draw_string_with_bg_alpha(
+        &mut self,
+        point: Point<usize>,
+        fg: Rgb,
+        bg: Rgb,
+        bg_alpha: f32,
+        string_chars: impl Iterator<Item = char>,
+        size_info: &SizeInfo,
+    ) {
+        let mut wide_char_spacer = false;
+        let cells = string_chars.enumerate().filter_map(|(i, character)| {
+            let flags = if wide_char_spacer {
+                wide_char_spacer = false;
+                return None;
+            } else if character.width() == Some(2) {
+                wide_char_spacer = true;
+                Flags::WIDE_CHAR
+            } else {
+                Flags::empty()
+            };
+
+            Some(RenderableCell {
+                point: Point::new(point.line, point.column + i),
+                character,
+                extra: None,
+                flags,
+                bg_alpha,
+                fg,
+                bg,
+                underline: fg,
+            })
+        });
+
+        self.renderer.draw_cells(size_info, &mut self.glyph_cache, cells);
+    }
+
     /// Draw compact tab bar labels.
     #[inline(never)]
-    fn draw_tab_bar(&mut self, config: &UiConfig, size_info: &SizeInfo, tabs: &[TabBarEntry]) {
+    fn draw_tab_bar(
+        &mut self,
+        config: &UiConfig,
+        size_info: &SizeInfo,
+        tabs: &[TabBarEntry],
+        bar_bg: Rgb,
+    ) {
         if tabs.is_empty() {
             return;
         }
@@ -1767,10 +1798,9 @@ impl Display {
         tab_size_info.padding_y = self.compact_tab_label_padding_y(config, size_info);
         self.renderer.resize(&tab_size_info);
 
-        let bar_bg = Self::compact_tab_bar_background(config);
-        let active_bg = Self::compact_tab_active_background(config);
+        let active_bg = Self::compact_tab_active_background(config, bar_bg);
         let active_fg = Self::compact_tab_active_foreground(config);
-        let inactive_fg = Self::compact_tab_inactive_foreground(config);
+        let inactive_fg = Self::compact_tab_inactive_foreground(config, bar_bg);
         let visual_active_index = self
             .compact_tab_drag_target
             .or_else(|| tabs.iter().position(|tab| tab.is_active))
@@ -1828,13 +1858,14 @@ impl Display {
             let point = Point::new(0, Column(start_column));
             let fg = if is_active { active_fg } else { inactive_fg };
             let bg = if is_active { active_bg } else { bar_bg };
-            self.renderer.draw_string(
+            let bg_alpha = if is_active { 1. } else { 0. };
+            self.draw_string_with_bg_alpha(
                 point,
                 fg,
                 bg,
+                bg_alpha,
                 label.chars(),
                 &tab_size_info,
-                &mut self.glyph_cache,
             );
         }
 
