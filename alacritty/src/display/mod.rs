@@ -32,10 +32,11 @@ use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point};
 use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{
-    self, LineDamageBounds, Term, TermDamage, TermMode, MIN_COLUMNS, MIN_SCREEN_LINES,
+    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
 };
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
+use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
 use crate::config::font::Font;
 #[cfg(target_os = "macos")]
@@ -43,19 +44,18 @@ use crate::config::window::Decorations;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
 use crate::config::window::{Dimensions, TabsMode};
-use crate::config::UiConfig;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
-use crate::display::damage::{damage_y_to_viewport_y, DamageTracker};
+use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
-use crate::renderer::{self, platform, GlyphCache, Renderer};
+use crate::renderer::{self, GlyphCache, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 
@@ -79,10 +79,10 @@ const BACKWARD_SEARCH_LABEL: &str = "Backward Search: ";
 const SHORTENER: char = '…';
 
 /// Horizontal spaces around each compact tab title.
-const COMPACT_TAB_SIDE_PADDING: usize = 1;
+const COMPACT_TAB_SIDE_PADDING: usize = 2;
 
 /// Spacing between compact tabs.
-const COMPACT_TAB_GAP_COLUMNS: usize = 1;
+const COMPACT_TAB_GAP_COLUMNS: usize = 0;
 
 /// Duration for compact tab active-state transition animation.
 const COMPACT_TAB_ANIMATION_DURATION: Duration = Duration::from_millis(280);
@@ -641,13 +641,33 @@ impl Display {
     }
 
     #[inline]
+    fn compact_tab_active_background(config: &UiConfig) -> Rgb {
+        let bar_bg = Self::compact_tab_bar_background(config);
+        let active_fg =
+            config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground);
+        Self::mix_rgb(bar_bg, active_fg, 0.1)
+    }
+
+    #[inline]
+    fn compact_tab_inactive_background(config: &UiConfig) -> Rgb {
+        let bar_bg = Self::compact_tab_bar_background(config);
+        let active_fg =
+            config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground);
+        Self::mix_rgb(bar_bg, active_fg, 0.035)
+    }
+
+    #[inline]
     fn compact_tab_active_foreground(config: &UiConfig) -> Rgb {
         config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground)
     }
 
     #[inline]
     fn compact_tab_inactive_foreground(config: &UiConfig) -> Rgb {
-        Self::mix_rgb(config.colors.primary.foreground, config.colors.primary.background, 0.35)
+        Self::mix_rgb(
+            config.colors.primary.foreground,
+            Self::compact_tab_bar_background(config),
+            0.58,
+        )
     }
 
     #[inline]
@@ -1382,8 +1402,13 @@ impl Display {
             let width = size_info.width() as i32;
             let height = self.compact_tab_bar_height(config, &size_info) as i32;
             let bg = Self::compact_tab_bar_background(config);
+            let divider_color =
+                Self::mix_rgb(bg, Self::compact_tab_active_foreground(config), 0.16);
             let tab_bar_rect = RenderRect::new(0., y, width as f32, height as f32, bg, 1.);
             ui_rects.push(tab_bar_rect);
+            let divider_y = (y + height as f32 - 1.).max(y);
+            let divider = RenderRect::new(0., divider_y, width as f32, 1., divider_color, 0.4);
+            ui_rects.push(divider);
 
             // Always damage tab bar in compact mode to keep updates deterministic.
             self.damage_tracker.frame().add_viewport_rect(&size_info, 0, y as i32, width, height);
@@ -1834,14 +1859,30 @@ impl Display {
         }
 
         let bar_bg = Self::compact_tab_bar_background(config);
+        let active_bg = Self::compact_tab_active_background(config);
+        let inactive_bg = Self::compact_tab_inactive_background(config);
         let active_fg = Self::compact_tab_active_foreground(config);
         let inactive_fg = Self::compact_tab_inactive_foreground(config);
-        let inactive_bg = bar_bg;
         let visual_active_index =
             self.compact_tab_active_index.filter(|&index| index < layout.visible_tabs);
         let cell_width = size_info.cell_width();
+        let tab_top = tab_size_info.padding_y;
+        let tab_height = size_info.cell_height();
+        let tab_bottom = tab_top + tab_height;
         let bar_top = size_info.padding_y();
         let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
+        let inactive_corner_cut_width = (cell_width * 0.24).round().clamp(1., 4.);
+        let inactive_corner_cut_height = (tab_height * 0.16).round().clamp(1., 3.);
+        let active_frame_top = bar_top;
+        let active_frame_bottom = bar_bottom;
+        let active_frame_height = (active_frame_bottom - active_frame_top).max(tab_height);
+        let active_corner_cut_width = (active_frame_height * 0.32).round().clamp(3., 10.);
+        let active_corner_cut_height = active_corner_cut_width;
+        let border_thickness = 1.;
+        let separator_color = Self::mix_rgb(bar_bg, inactive_fg, 0.14);
+        let inactive_border = Self::mix_rgb(inactive_bg, inactive_fg, 0.18);
+        let active_border = Self::mix_rgb(active_bg, active_fg, 0.24);
+        let active_glow = Self::mix_rgb(active_bg, active_fg, 0.55);
 
         let mut slots = Vec::with_capacity(layout.visible_tabs);
         let mut next_column = layout.start_column;
@@ -1880,20 +1921,7 @@ impl Display {
         for (index, (tab, (start_column, slot_width))) in
             tabs.iter().take(layout.visible_tabs).zip(slots.iter().copied()).enumerate()
         {
-            if index > 0 {
-                let gap_start = start_column - COMPACT_TAB_GAP_COLUMNS;
-                let point = Point::new(0, Column(gap_start));
-                let gap = " ".repeat(COMPACT_TAB_GAP_COLUMNS);
-                self.renderer.draw_string(
-                    point,
-                    inactive_fg,
-                    inactive_bg,
-                    gap.chars(),
-                    &tab_size_info,
-                    &mut self.glyph_cache,
-                );
-            }
-
+            let is_active = Some(index) == visual_active_index;
             let inner_width = slot_width.saturating_sub(COMPACT_TAB_SIDE_PADDING * 2);
             let title: String = StrShortener::new(
                 &tab.title,
@@ -1913,69 +1941,233 @@ impl Display {
             label.extend(std::iter::repeat_n(' ', COMPACT_TAB_SIDE_PADDING + right_extra_padding));
 
             let point = Point::new(0, Column(start_column));
-            let fg = if Some(index) == visual_active_index { active_fg } else { inactive_fg };
+            let fg = if is_active { active_fg } else { inactive_fg };
+            let bg = if is_active { active_bg } else { inactive_bg };
             self.renderer.draw_string(
                 point,
                 fg,
-                inactive_bg,
+                bg,
                 label.chars(),
                 &tab_size_info,
                 &mut self.glyph_cache,
             );
         }
 
-        let separator_color = Self::mix_rgb(inactive_fg, bar_bg, 0.72);
-        let separator_width = (cell_width * 0.08).max(1.);
-        let separator_margin = (size_info.cell_height() * 0.22).max(2.);
-        let separator_y = bar_top + separator_margin;
-        let separator_height = (bar_bottom - bar_top - separator_margin * 2.).max(1.);
-
-        let inactive_indicator_color = Self::mix_rgb(inactive_fg, bar_bg, 0.45);
-        let inactive_indicator_height = (size_info.cell_height() * 0.08).max(1.);
-        let inactive_indicator_y = (bar_bottom - inactive_indicator_height).max(bar_top);
-
-        let mut decoration_rects = Vec::with_capacity(slots.len().saturating_mul(2));
+        let mut decoration_rects = Vec::with_capacity(slots.len().saturating_mul(10) + 8);
         for (index, (start_column, slot_width)) in slots.iter().copied().enumerate() {
-            if Some(index) != visual_active_index {
-                let x = size_info.padding_x() + start_column as f32 * cell_width;
-                let width = slot_width as f32 * cell_width;
-                let indicator = RenderRect::new(
+            let is_active = Some(index) == visual_active_index;
+            let x = size_info.padding_x() + start_column as f32 * cell_width;
+            let width = slot_width as f32 * cell_width;
+            let border_color = if is_active { active_border } else { inactive_border };
+            let border_alpha = if is_active { 0.6 } else { 0.16 };
+
+            if index > 0
+                && Some(index - 1) != visual_active_index
+                && Some(index) != visual_active_index
+            {
+                decoration_rects.push(RenderRect::new(
                     x,
-                    inactive_indicator_y,
-                    width,
-                    inactive_indicator_height,
-                    inactive_indicator_color,
-                    1.,
-                );
-                decoration_rects.push(indicator);
+                    tab_top + inactive_corner_cut_height,
+                    border_thickness,
+                    (bar_bottom - tab_top - inactive_corner_cut_height - border_thickness)
+                        .max(1.),
+                    separator_color,
+                    0.35,
+                ));
             }
 
-            if index > 0 {
-                let gap_start = start_column - COMPACT_TAB_GAP_COLUMNS;
-                let gap_center = gap_start as f32 + COMPACT_TAB_GAP_COLUMNS as f32 * 0.5;
-                let x = size_info.padding_x() + gap_center * cell_width - separator_width * 0.5;
-                let separator = RenderRect::new(
-                    x,
-                    separator_y,
-                    separator_width,
-                    separator_height,
-                    separator_color,
-                    1.,
-                );
-                decoration_rects.push(separator);
+            if is_active {
+                let top_fill_height = (tab_top - active_frame_top).max(0.);
+                if top_fill_height > 0. {
+                    decoration_rects.push(RenderRect::new(
+                        x,
+                        active_frame_top,
+                        width,
+                        top_fill_height,
+                        active_bg,
+                        1.,
+                    ));
+                }
+
+                let bottom_fill_y = tab_bottom.min(active_frame_bottom);
+                let bottom_fill_height = (active_frame_bottom - bottom_fill_y).max(0.);
+                if bottom_fill_height > 0. {
+                    decoration_rects.push(RenderRect::new(
+                        x,
+                        bottom_fill_y,
+                        width,
+                        bottom_fill_height,
+                        active_bg,
+                        1.,
+                    ));
+                }
             }
-        }
-        if !decoration_rects.is_empty() {
-            self.renderer.draw_rects(size_info, &self.glyph_cache.font_metrics(), decoration_rects);
+
+            if !is_active
+                && width > inactive_corner_cut_width * 2.
+                && tab_height > inactive_corner_cut_height * 2.
+            {
+                decoration_rects.push(RenderRect::new(
+                    x,
+                    tab_top,
+                    inactive_corner_cut_width,
+                    inactive_corner_cut_height,
+                    bar_bg,
+                    1.,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x + width - inactive_corner_cut_width,
+                    tab_top,
+                    inactive_corner_cut_width,
+                    inactive_corner_cut_height,
+                    bar_bg,
+                    1.,
+                ));
+            }
+
+            if is_active
+                && width > active_corner_cut_width * 2.
+                && active_frame_height > active_corner_cut_height * 2.
+            {
+                let horizontal_width = (width - active_corner_cut_width * 2.).max(1.);
+                let side_y = active_frame_top + active_corner_cut_height + 1.;
+                let vertical_height =
+                    (active_frame_height - active_corner_cut_height * 2. - 2.).max(1.);
+                let side_border_alpha = border_alpha * 0.4;
+
+                let corner_steps = active_corner_cut_height.max(1.) as usize;
+                let radius = active_corner_cut_height.max(1.);
+                for step in 0..corner_steps {
+                    let step_f = step as f32;
+                    let dy = (radius - step_f - 1.).max(0.);
+                    let normalized = (radius.mul_add(radius, -(dy * dy))).max(0.).sqrt() / radius;
+                    let mask_width = (active_corner_cut_width * (1. - normalized)).round();
+                    if mask_width <= 0. {
+                        continue;
+                    }
+
+                    let top_y = active_frame_top + step_f;
+                    let bottom_y = active_frame_bottom - step_f - 1.;
+                    decoration_rects.push(RenderRect::new(
+                        x,
+                        top_y,
+                        mask_width,
+                        1.,
+                        bar_bg,
+                        1.,
+                    ));
+                    decoration_rects.push(RenderRect::new(
+                        x + width - mask_width,
+                        top_y,
+                        mask_width,
+                        1.,
+                        bar_bg,
+                        1.,
+                    ));
+                    decoration_rects.push(RenderRect::new(
+                        x,
+                        bottom_y,
+                        mask_width,
+                        1.,
+                        bar_bg,
+                        1.,
+                    ));
+                    decoration_rects.push(RenderRect::new(
+                        x + width - mask_width,
+                        bottom_y,
+                        mask_width,
+                        1.,
+                        bar_bg,
+                        1.,
+                    ));
+                }
+
+                decoration_rects.push(RenderRect::new(
+                    x + active_corner_cut_width,
+                    active_frame_top,
+                    horizontal_width,
+                    border_thickness,
+                    border_color,
+                    border_alpha,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x + active_corner_cut_width,
+                    active_frame_bottom - border_thickness,
+                    horizontal_width,
+                    border_thickness,
+                    border_color,
+                    border_alpha,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x,
+                    side_y,
+                    border_thickness,
+                    vertical_height,
+                    border_color,
+                    side_border_alpha,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x + width - border_thickness,
+                    side_y,
+                    border_thickness,
+                    vertical_height,
+                    border_color,
+                    side_border_alpha,
+                ));
+            } else if is_active {
+                decoration_rects.push(RenderRect::new(
+                    x,
+                    active_frame_top,
+                    width,
+                    border_thickness,
+                    border_color,
+                    border_alpha,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x,
+                    active_frame_bottom - border_thickness,
+                    width,
+                    border_thickness,
+                    border_color,
+                    border_alpha,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x,
+                    active_frame_top,
+                    border_thickness,
+                    active_frame_height,
+                    border_color,
+                    border_alpha,
+                ));
+                decoration_rects.push(RenderRect::new(
+                    x + width - border_thickness,
+                    active_frame_top,
+                    border_thickness,
+                    active_frame_height,
+                    border_color,
+                    border_alpha,
+                ));
+            }
+
         }
 
         if let Some((start_column, len_columns)) = indicator_bounds {
             let x = size_info.padding_x() + start_column * cell_width;
             let width = len_columns * cell_width;
-            let indicator_height = (size_info.cell_height() * 0.2).max(3.);
-            let y = (bar_bottom - indicator_height).max(size_info.padding_y());
-            let indicator = RenderRect::new(x, y, width, indicator_height, active_fg, 1.);
-            self.renderer.draw_rects(size_info, &self.glyph_cache.font_metrics(), vec![indicator]);
+            let glow_width = (width - active_corner_cut_width * 2.).max(1.);
+            let glow = RenderRect::new(
+                x + active_corner_cut_width,
+                active_frame_top,
+                glow_width,
+                border_thickness,
+                active_glow,
+                0.9,
+            );
+            decoration_rects.push(glow);
+        }
+
+        if !decoration_rects.is_empty() {
+            self.renderer.draw_rects(size_info, &self.glyph_cache.font_metrics(), decoration_rects);
         }
 
         // Restore the default text projection after compact tab-title rendering.
@@ -2246,11 +2438,7 @@ fn window_size(
 #[inline]
 fn effective_window_padding(config: &UiConfig, scale_factor: f32) -> (f32, f32) {
     let padding = config.window.padding(scale_factor);
-    if matches!(config.window.tabs.mode, TabsMode::Compact) {
-        (padding.0, 0.)
-    } else {
-        padding
-    }
+    if matches!(config.window.tabs.mode, TabsMode::Compact) { (padding.0, 0.) } else { padding }
 }
 
 /// Top padding used for compact-mode hit-testing.
@@ -2268,7 +2456,7 @@ fn compact_top_padding_y(size_info: &SizeInfo, top_inset: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_top_padding_y, SizeInfo};
+    use super::{SizeInfo, compact_top_padding_y};
 
     #[test]
     fn compact_top_padding_includes_viewport_remainder() {
