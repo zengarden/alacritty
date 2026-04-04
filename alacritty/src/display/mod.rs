@@ -635,14 +635,6 @@ impl Display {
     }
 
     #[inline]
-    fn compact_tab_inactive_background(config: &UiConfig) -> Rgb {
-        let bar_bg = Self::compact_tab_bar_background(config);
-        let active_fg =
-            config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground);
-        Self::mix_rgb(bar_bg, active_fg, 0.035)
-    }
-
-    #[inline]
     fn compact_tab_active_foreground(config: &UiConfig) -> Rgb {
         config.colors.primary.bright_foreground.unwrap_or(config.colors.primary.foreground)
     }
@@ -1777,7 +1769,6 @@ impl Display {
 
         let bar_bg = Self::compact_tab_bar_background(config);
         let active_bg = Self::compact_tab_active_background(config);
-        let inactive_bg = Self::compact_tab_inactive_background(config);
         let active_fg = Self::compact_tab_active_foreground(config);
         let inactive_fg = Self::compact_tab_inactive_foreground(config);
         let visual_active_index = self
@@ -1790,8 +1781,7 @@ impl Display {
         let tab_bottom = tab_top + tab_height;
         let bar_top = size_info.padding_y();
         let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
-        let inactive_corner_cut_width = (cell_width * 0.24).round().clamp(1., 4.);
-        let inactive_corner_cut_height = (tab_height * 0.16).round().clamp(1., 3.);
+        let separator_top_inset = (tab_height * 0.16).round().clamp(1., 3.);
         let active_frame_top = bar_top;
         let active_frame_bottom = bar_bottom;
         let active_frame_height = (active_frame_bottom - active_frame_top).max(tab_height);
@@ -1799,7 +1789,6 @@ impl Display {
         let active_corner_cut_height = active_corner_cut_width;
         let border_thickness = 1.;
         let separator_color = Self::mix_rgb(bar_bg, inactive_fg, 0.14);
-        let inactive_border = Self::mix_rgb(inactive_bg, inactive_fg, 0.18);
         let active_border = Self::mix_rgb(active_bg, active_fg, 0.24);
 
         let mut slots = Vec::with_capacity(layout.visible_tabs);
@@ -1838,7 +1827,7 @@ impl Display {
 
             let point = Point::new(0, Column(start_column));
             let fg = if is_active { active_fg } else { inactive_fg };
-            let bg = if is_active { active_bg } else { inactive_bg };
+            let bg = if is_active { active_bg } else { bar_bg };
             self.renderer.draw_string(
                 point,
                 fg,
@@ -1854,8 +1843,7 @@ impl Display {
             let is_active = Some(index) == visual_active_index;
             let x = size_info.padding_x() + start_column as f32 * cell_width;
             let width = slot_width as f32 * cell_width;
-            let border_color = if is_active { active_border } else { inactive_border };
-            let border_alpha = if is_active { 0.6 } else { 0.16 };
+            let border_alpha = 0.6;
 
             if index > 0
                 && Some(index - 1) != visual_active_index
@@ -1863,9 +1851,9 @@ impl Display {
             {
                 decoration_rects.push(RenderRect::new(
                     x,
-                    tab_top + inactive_corner_cut_height,
+                    tab_top + separator_top_inset,
                     border_thickness,
-                    (bar_bottom - tab_top - inactive_corner_cut_height - border_thickness).max(1.),
+                    (bar_bottom - tab_top - separator_top_inset - border_thickness).max(1.),
                     separator_color,
                     0.35,
                 ));
@@ -1896,28 +1884,6 @@ impl Display {
                         1.,
                     ));
                 }
-            }
-
-            if !is_active
-                && width > inactive_corner_cut_width * 2.
-                && tab_height > inactive_corner_cut_height * 2.
-            {
-                decoration_rects.push(RenderRect::new(
-                    x,
-                    tab_top,
-                    inactive_corner_cut_width,
-                    inactive_corner_cut_height,
-                    bar_bg,
-                    1.,
-                ));
-                decoration_rects.push(RenderRect::new(
-                    x + width - inactive_corner_cut_width,
-                    tab_top,
-                    inactive_corner_cut_width,
-                    inactive_corner_cut_height,
-                    bar_bg,
-                    1.,
-                ));
             }
 
             if is_active
@@ -1964,7 +1930,7 @@ impl Display {
                     active_frame_bottom - border_thickness,
                     horizontal_width,
                     border_thickness,
-                    border_color,
+                    active_border,
                     border_alpha,
                 ));
             } else if is_active {
@@ -1973,7 +1939,7 @@ impl Display {
                     active_frame_bottom - border_thickness,
                     width,
                     border_thickness,
-                    border_color,
+                    active_border,
                     border_alpha,
                 ));
             }
