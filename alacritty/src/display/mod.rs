@@ -2030,10 +2030,6 @@ impl Display {
                 && active_frame_height > active_corner_cut_height * 2.
             {
                 let horizontal_width = (width - active_corner_cut_width * 2.).max(1.);
-                let side_y = active_frame_top + active_corner_cut_height + 1.;
-                let vertical_height =
-                    (active_frame_height - active_corner_cut_height * 2. - 2.).max(1.);
-                let side_border_alpha = border_alpha * 0.4;
 
                 let corner_steps = active_corner_cut_height.max(1.) as usize;
                 let radius = active_corner_cut_height.max(1.);
@@ -2098,22 +2094,6 @@ impl Display {
                     border_color,
                     border_alpha,
                 ));
-                decoration_rects.push(RenderRect::new(
-                    x,
-                    side_y,
-                    border_thickness,
-                    vertical_height,
-                    border_color,
-                    side_border_alpha,
-                ));
-                decoration_rects.push(RenderRect::new(
-                    x + width - border_thickness,
-                    side_y,
-                    border_thickness,
-                    vertical_height,
-                    border_color,
-                    side_border_alpha,
-                ));
             } else if is_active {
                 decoration_rects.push(RenderRect::new(
                     x,
@@ -2128,22 +2108,6 @@ impl Display {
                     active_frame_bottom - border_thickness,
                     width,
                     border_thickness,
-                    border_color,
-                    border_alpha,
-                ));
-                decoration_rects.push(RenderRect::new(
-                    x,
-                    active_frame_top,
-                    border_thickness,
-                    active_frame_height,
-                    border_color,
-                    border_alpha,
-                ));
-                decoration_rects.push(RenderRect::new(
-                    x + width - border_thickness,
-                    active_frame_top,
-                    border_thickness,
-                    active_frame_height,
                     border_color,
                     border_alpha,
                 ));
