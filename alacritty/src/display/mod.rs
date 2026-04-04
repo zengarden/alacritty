@@ -84,9 +84,6 @@ const COMPACT_TAB_SIDE_PADDING: usize = 2;
 /// Spacing between compact tabs.
 const COMPACT_TAB_GAP_COLUMNS: usize = 0;
 
-/// Duration for compact tab active-state transition animation.
-const COMPACT_TAB_ANIMATION_DURATION: Duration = Duration::from_millis(280);
-
 /// Reserved left area for macOS traffic-light buttons in compact mode.
 #[cfg(target_os = "macos")]
 const MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK: f32 = 86.;
@@ -388,12 +385,6 @@ impl CompactTabLayout {
     }
 }
 
-/// Active tab transition state for compact tab animation.
-#[derive(Copy, Clone, Debug)]
-struct CompactTabAnimation {
-    started_at: Instant,
-}
-
 /// The display wraps a window, font rasterizer, and GPU renderer.
 pub struct Display {
     pub window: Window,
@@ -441,8 +432,6 @@ pub struct Display {
     /// Font size used by the window.
     pub font_size: FontSize,
 
-    compact_tab_active_index: Option<usize>,
-    compact_tab_animation: Option<CompactTabAnimation>,
     compact_tab_drag_target: Option<usize>,
 
     // Mouse point position when highlighting hints.
@@ -601,8 +590,6 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
-            compact_tab_active_index: Default::default(),
-            compact_tab_animation: Default::default(),
             compact_tab_drag_target: Default::default(),
         })
     }
@@ -797,47 +784,13 @@ impl Display {
     }
 
     #[inline]
-    fn update_compact_tab_animation(&mut self, active_index: Option<usize>) {
-        if self.compact_tab_active_index == active_index {
-            return;
-        }
-
-        self.compact_tab_animation = match (self.compact_tab_active_index, active_index) {
-            (Some(previous_active), Some(current_active)) if previous_active != current_active => {
-                Some(CompactTabAnimation { started_at: Instant::now() })
-            },
-            _ => None,
-        };
-
-        self.compact_tab_active_index = active_index;
-    }
-
-    #[inline]
     pub fn set_compact_tab_drag_target(&mut self, target: Option<usize>) -> bool {
         if self.compact_tab_drag_target == target {
             return false;
         }
 
         self.compact_tab_drag_target = target;
-        if let Some(target) = target {
-            // Drag preview should be immediate and stable under high-frequency mouse move events.
-            self.compact_tab_animation = None;
-            self.compact_tab_active_index = Some(target);
-        }
         true
-    }
-
-    #[inline]
-    pub fn compact_tab_animation_active(&self) -> bool {
-        let Some(animation) = self.compact_tab_animation else {
-            return false;
-        };
-        if COMPACT_TAB_ANIMATION_DURATION.is_zero() {
-            return false;
-        }
-
-        Instant::now().saturating_duration_since(animation.started_at)
-            < COMPACT_TAB_ANIMATION_DURATION
     }
 
     #[inline]
@@ -1179,18 +1132,8 @@ impl Display {
         let terminal_size_info =
             self.terminal_render_size_info(config, terminal_screen_lines, bottom_reserved_lines);
         let top_bar_lines = self.compact_tab_lines(config, &size_info);
-        if top_bar_lines != 0 {
-            let active_index = tab_bar_entries.iter().position(|tab| tab.is_active);
-            let visual_active_index = self.compact_tab_drag_target.or(active_index);
-            if self.compact_tab_drag_target.is_some() {
-                self.compact_tab_active_index = visual_active_index;
-                self.compact_tab_animation = None;
-            } else {
-                self.update_compact_tab_animation(visual_active_index);
-            }
-        } else {
+        if top_bar_lines == 0 {
             self.compact_tab_drag_target = None;
-            self.update_compact_tab_animation(None);
         }
 
         let vi_mode = terminal.mode().contains(TermMode::VI);
@@ -1837,8 +1780,10 @@ impl Display {
         let inactive_bg = Self::compact_tab_inactive_background(config);
         let active_fg = Self::compact_tab_active_foreground(config);
         let inactive_fg = Self::compact_tab_inactive_foreground(config);
-        let visual_active_index =
-            self.compact_tab_active_index.filter(|&index| index < layout.visible_tabs);
+        let visual_active_index = self
+            .compact_tab_drag_target
+            .or_else(|| tabs.iter().position(|tab| tab.is_active))
+            .filter(|&index| index < layout.visible_tabs);
         let cell_width = size_info.cell_width();
         let tab_top = tab_size_info.padding_y;
         let tab_height = size_info.cell_height();
@@ -1920,8 +1865,7 @@ impl Display {
                     x,
                     tab_top + inactive_corner_cut_height,
                     border_thickness,
-                    (bar_bottom - tab_top - inactive_corner_cut_height - border_thickness)
-                        .max(1.),
+                    (bar_bottom - tab_top - inactive_corner_cut_height - border_thickness).max(1.),
                     separator_color,
                     0.35,
                 ));
@@ -1995,14 +1939,7 @@ impl Display {
 
                     let top_y = active_frame_top + step_f;
                     let bottom_y = active_frame_bottom - step_f - 1.;
-                    decoration_rects.push(RenderRect::new(
-                        x,
-                        top_y,
-                        mask_width,
-                        1.,
-                        bar_bg,
-                        1.,
-                    ));
+                    decoration_rects.push(RenderRect::new(x, top_y, mask_width, 1., bar_bg, 1.));
                     decoration_rects.push(RenderRect::new(
                         x + width - mask_width,
                         top_y,
@@ -2011,14 +1948,7 @@ impl Display {
                         bar_bg,
                         1.,
                     ));
-                    decoration_rects.push(RenderRect::new(
-                        x,
-                        bottom_y,
-                        mask_width,
-                        1.,
-                        bar_bg,
-                        1.,
-                    ));
+                    decoration_rects.push(RenderRect::new(x, bottom_y, mask_width, 1., bar_bg, 1.));
                     decoration_rects.push(RenderRect::new(
                         x + width - mask_width,
                         bottom_y,
@@ -2047,7 +1977,6 @@ impl Display {
                     border_alpha,
                 ));
             }
-
         }
 
         if !decoration_rects.is_empty() {

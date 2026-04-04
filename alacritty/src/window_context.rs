@@ -34,8 +34,8 @@ use alacritty_terminal::tty;
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
-use crate::config::window::TabsMode;
 use crate::config::UiConfig;
+use crate::config::window::TabsMode;
 use crate::display::window::Window;
 use crate::display::{Display, TabBarEntry};
 use crate::event::{ActionContext, Event, EventProxy, Mouse, SearchState, TouchPurpose};
@@ -304,11 +304,7 @@ impl WindowContext {
         }
 
         let cwd = working_directory.to_string_lossy();
-        if cwd.is_empty() {
-            String::from("Shell")
-        } else {
-            cwd.into_owned()
-        }
+        if cwd.is_empty() { String::from("Shell") } else { cwd.into_owned() }
     }
 
     fn refresh_window_title(&mut self) {
@@ -737,8 +733,7 @@ impl WindowContext {
         display.process_renderer_update();
 
         // Request immediate re-draw if visual bell animation is not finished yet.
-        let compact_tab_animation_active = display.compact_tab_animation_active();
-        if !display.visual_bell.completed() || compact_tab_animation_active {
+        if !display.visual_bell.completed() {
             // We can get an OS redraw which bypasses alacritty's frame throttling, thus
             // marking the window as dirty when we don't have frame yet.
             if display.window.has_frame {
