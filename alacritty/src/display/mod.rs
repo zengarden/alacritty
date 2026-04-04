@@ -1841,8 +1841,13 @@ impl Display {
         let mut decoration_rects = Vec::with_capacity(slots.len().saturating_mul(10) + 8);
         for (index, (start_column, slot_width)) in slots.iter().copied().enumerate() {
             let is_active = Some(index) == visual_active_index;
+            let is_first_visible = index == 0;
+            let is_last_visible = index + 1 == layout.visible_tabs;
             let x = size_info.padding_x() + start_column as f32 * cell_width;
             let width = slot_width as f32 * cell_width;
+            let active_x = if is_first_visible { 0. } else { x };
+            let active_right = if is_last_visible { size_info.width() } else { x + width };
+            let active_width = active_right - active_x;
             let border_alpha = 0.6;
 
             if index > 0
@@ -1863,9 +1868,9 @@ impl Display {
                 let top_fill_height = (tab_top - active_frame_top).max(0.);
                 if top_fill_height > 0. {
                     decoration_rects.push(RenderRect::new(
-                        x,
+                        active_x,
                         active_frame_top,
-                        width,
+                        active_width,
                         top_fill_height,
                         active_bg,
                         1.,
@@ -1876,10 +1881,31 @@ impl Display {
                 let bottom_fill_height = (active_frame_bottom - bottom_fill_y).max(0.);
                 if bottom_fill_height > 0. {
                     decoration_rects.push(RenderRect::new(
-                        x,
+                        active_x,
                         bottom_fill_y,
-                        width,
+                        active_width,
                         bottom_fill_height,
+                        active_bg,
+                        1.,
+                    ));
+                }
+
+                if active_x < x {
+                    decoration_rects.push(RenderRect::new(
+                        active_x,
+                        tab_top,
+                        x - active_x,
+                        tab_height,
+                        active_bg,
+                        1.,
+                    ));
+                }
+                if active_right > x + width {
+                    decoration_rects.push(RenderRect::new(
+                        x + width,
+                        tab_top,
+                        active_right - (x + width),
+                        tab_height,
                         active_bg,
                         1.,
                     ));
@@ -1887,10 +1913,12 @@ impl Display {
             }
 
             if is_active
-                && width > active_corner_cut_width * 2.
+                && active_width > active_corner_cut_width * 2.
                 && active_frame_height > active_corner_cut_height * 2.
             {
-                let horizontal_width = (width - active_corner_cut_width * 2.).max(1.);
+                let left_corner_cut = if is_first_visible { 0. } else { active_corner_cut_width };
+                let right_corner_cut = if is_last_visible { 0. } else { active_corner_cut_width };
+                let horizontal_width = (active_width - left_corner_cut - right_corner_cut).max(1.);
 
                 let corner_steps = active_corner_cut_height.max(1.) as usize;
                 let radius = active_corner_cut_height.max(1.);
@@ -1899,34 +1927,64 @@ impl Display {
                     let dy = (radius - step_f - 1.).max(0.);
                     let normalized = (radius.mul_add(radius, -(dy * dy))).max(0.).sqrt() / radius;
                     let mask_width = (active_corner_cut_width * (1. - normalized)).round();
-                    if mask_width <= 0. {
+                    let left_top_mask_width = mask_width;
+                    let right_top_mask_width = mask_width;
+                    let left_bottom_mask_width = if is_first_visible { 0. } else { mask_width };
+                    let right_bottom_mask_width = if is_last_visible { 0. } else { mask_width };
+                    if left_top_mask_width <= 0.
+                        && right_top_mask_width <= 0.
+                        && left_bottom_mask_width <= 0.
+                        && right_bottom_mask_width <= 0.
+                    {
                         continue;
                     }
 
                     let top_y = active_frame_top + step_f;
                     let bottom_y = active_frame_bottom - step_f - 1.;
-                    decoration_rects.push(RenderRect::new(x, top_y, mask_width, 1., bar_bg, 1.));
-                    decoration_rects.push(RenderRect::new(
-                        x + width - mask_width,
-                        top_y,
-                        mask_width,
-                        1.,
-                        bar_bg,
-                        1.,
-                    ));
-                    decoration_rects.push(RenderRect::new(x, bottom_y, mask_width, 1., bar_bg, 1.));
-                    decoration_rects.push(RenderRect::new(
-                        x + width - mask_width,
-                        bottom_y,
-                        mask_width,
-                        1.,
-                        bar_bg,
-                        1.,
-                    ));
+                    if left_top_mask_width > 0. {
+                        decoration_rects.push(RenderRect::new(
+                            active_x,
+                            top_y,
+                            left_top_mask_width,
+                            1.,
+                            bar_bg,
+                            1.,
+                        ));
+                    }
+                    if left_bottom_mask_width > 0. {
+                        decoration_rects.push(RenderRect::new(
+                            active_x,
+                            bottom_y,
+                            left_bottom_mask_width,
+                            1.,
+                            bar_bg,
+                            1.,
+                        ));
+                    }
+                    if right_top_mask_width > 0. {
+                        decoration_rects.push(RenderRect::new(
+                            active_right - right_top_mask_width,
+                            top_y,
+                            right_top_mask_width,
+                            1.,
+                            bar_bg,
+                            1.,
+                        ));
+                    }
+                    if right_bottom_mask_width > 0. {
+                        decoration_rects.push(RenderRect::new(
+                            active_right - right_bottom_mask_width,
+                            bottom_y,
+                            right_bottom_mask_width,
+                            1.,
+                            bar_bg,
+                            1.,
+                        ));
+                    }
                 }
 
                 decoration_rects.push(RenderRect::new(
-                    x + active_corner_cut_width,
+                    active_x + left_corner_cut,
                     active_frame_bottom - border_thickness,
                     horizontal_width,
                     border_thickness,
@@ -1935,9 +1993,9 @@ impl Display {
                 ));
             } else if is_active {
                 decoration_rects.push(RenderRect::new(
-                    x,
+                    active_x,
                     active_frame_bottom - border_thickness,
-                    width,
+                    active_width,
                     border_thickness,
                     active_border,
                     border_alpha,
