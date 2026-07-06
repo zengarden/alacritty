@@ -88,10 +88,6 @@ const COMPACT_TAB_GAP_COLUMNS: usize = 0;
 #[cfg(target_os = "macos")]
 const MACOS_TRAFFIC_LIGHTS_RESERVED_WIDTH_FALLBACK: f32 = 86.;
 
-/// Approximate native titlebar height in macOS compact mode.
-#[cfg(target_os = "macos")]
-const MACOS_COMPACT_TITLEBAR_HEIGHT: f32 = 30.;
-
 /// Extra gap between macOS compact tabs and terminal content.
 #[cfg(target_os = "macos")]
 const MACOS_COMPACT_CONTENT_GAP: f32 = 0.;
@@ -617,6 +613,18 @@ impl Display {
     }
 
     #[inline]
+    fn compact_tab_top_y(&self, config: &UiConfig, size_info: &SizeInfo) -> f32 {
+        let bar_height = self.compact_tab_bar_height(config, size_info);
+        if bar_height == 0. {
+            return size_info.padding_y();
+        }
+
+        let terminal_top =
+            compact_top_padding_y(size_info, self.compact_tab_top_inset(config, size_info));
+        (terminal_top - bar_height).max(size_info.padding_y())
+    }
+
+    #[inline]
     fn mix_rgb(base: Rgb, overlay: Rgb, overlay_weight: f32) -> Rgb {
         base * (1. - overlay_weight) + overlay * overlay_weight
     }
@@ -644,18 +652,7 @@ impl Display {
             return 0.;
         }
 
-        let cell_height = size_info.cell_height();
-
-        #[cfg(target_os = "macos")]
-        {
-            if !matches!(config.window.decorations, Decorations::None) {
-                let native_height =
-                    self.window.titlebar_height().unwrap_or(MACOS_COMPACT_TITLEBAR_HEIGHT);
-                return cell_height.max(native_height);
-            }
-        }
-
-        cell_height
+        size_info.cell_height()
     }
 
     #[inline]
@@ -688,7 +685,7 @@ impl Display {
             }
         }
 
-        size_info.padding_y() + row_top
+        self.compact_tab_top_y(config, size_info) + row_top
     }
 
     #[inline]
@@ -818,9 +815,8 @@ impl Display {
             return None;
         }
 
-        let top = self.size_info.padding_y() as usize;
-        let bottom = (self.size_info.padding_y()
-            + self.compact_tab_bar_height(config, &self.size_info)) as usize;
+        let top = self.compact_tab_top_y(config, &self.size_info) as usize;
+        let bottom = (top as f32 + self.compact_tab_bar_height(config, &self.size_info)) as usize;
         if y < top || y > bottom {
             return None;
         }
@@ -1302,7 +1298,7 @@ impl Display {
         self.renderer.resize(&size_info);
 
         if top_bar_lines != 0 {
-            let y = size_info.padding_y();
+            let y = self.compact_tab_top_y(config, &size_info);
             let width = size_info.width() as i32;
             let height = self.compact_tab_bar_height(config, &size_info) as i32;
             let bg = background_color;
@@ -1809,10 +1805,10 @@ impl Display {
         let tab_top = tab_size_info.padding_y;
         let tab_height = size_info.cell_height();
         let tab_bottom = tab_top + tab_height;
-        let bar_top = size_info.padding_y();
-        let bar_bottom = size_info.padding_y() + self.compact_tab_bar_height(config, size_info);
+        let bar_top = self.compact_tab_top_y(config, size_info);
+        let bar_bottom = bar_top + self.compact_tab_bar_height(config, size_info);
         let separator_top_inset = (tab_height * 0.16).round().clamp(1., 3.);
-        let active_frame_top = bar_top;
+        let active_frame_top = size_info.padding_y();
         let active_frame_bottom = bar_bottom;
         let active_frame_height = (active_frame_bottom - active_frame_top).max(tab_height);
         let active_corner_cut_width = (active_frame_height * 0.32).round().clamp(3., 10.);

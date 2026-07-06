@@ -546,24 +546,6 @@ impl Window {
         window.setMovable(movable);
     }
 
-    /// macOS titlebar height in physical pixels.
-    ///
-    /// This uses `contentLayoutRect` to follow native titlebar geometry instead of relying on
-    /// hardcoded constants.
-    #[cfg(target_os = "macos")]
-    pub fn titlebar_height(&self) -> Option<f32> {
-        const TITLEBAR_VISUAL_ADJUST_PX: f32 = 1.;
-
-        let view = self.appkit_view()?;
-
-        let window = view.window()?;
-        let native_height =
-            (window.frame().size.height - window.contentLayoutRect().size.height).max(0.);
-        let native_height_px = native_height as f32 * self.scale_factor as f32;
-
-        Some((native_height_px - TITLEBAR_VISUAL_ADJUST_PX).max(0.))
-    }
-
     /// Horizontal reservation for macOS traffic lights in physical pixels.
     #[cfg(target_os = "macos")]
     pub fn traffic_lights_reserved_width(&self) -> Option<f32> {
